@@ -12,8 +12,14 @@ from .response import OllamaResponseHandler
 
 logger = logging.getLogger(__name__)
 
-def create_api(ollama_endpoint: str, api_key: str = None):
-    """Create the FastAPI app."""
+def create_api(ollama_endpoint: str, api_key: str = None, request_logger=None):
+    """Create the FastAPI app.
+    
+    Args:
+        ollama_endpoint: URL of the Ollama API
+        api_key: Optional API key for authentication
+        request_logger: Optional request logger for GUI integration
+    """
     app = FastAPI(title="OllamaLink")
     
     # Initialize router and handlers
@@ -37,6 +43,165 @@ def create_api(ollama_endpoint: str, api_key: str = None):
         response = await call_next(request)
         response.headers["Access-Control-Allow-Origin"] = "*"
         return response
+    
+    # Add request logging middleware for GUI integration if a logger is provided
+    if request_logger:
+        @app.middleware("http")
+        async def request_logging_middleware(request: Request, call_next):
+            # Only intercept chat completions for logging
+            if "/v1/chat/completions" in request.url.path:
+                try:
+
+                    original_receive = request._receive
+
+                    body_bytes = None
+                    body_processed = False
+
+                    async def patched_receive():
+                        nonlocal body_bytes, body_processed
+                        
+                        # Get message from original receive
+                        message = await original_receive()
+                        
+                        # Only process http.request messages with body once
+                        if message["type"] == "http.request" and not body_processed:
+                            body = message.get("body", b"")
+                            more_body = message.get("more_body", False)
+                            
+                            # If this is the first chunk or the only chunk, store it
+                            if body and not body_bytes:
+                                body_bytes = body
+                                
+                                # Try to parse as JSON for logging
+                                if not more_body:  # If this is the complete body
+                                    body_processed = True
+                                    try:
+                                        request_data = json.loads(body.decode())
+                                        # Log the request in the GUI
+                                        request_logger.log_request(request_data)
+                                    except json.JSONDecodeError:
+                                        pass
+                            
+                            # If we're getting more body chunks, append them
+                            elif more_body and body:
+                                if body_bytes:
+                                    body_bytes += body
+                                else:
+                                    body_bytes = body
+                            
+                            # If no more body chunks expected, mark as processed and try to parse
+                            if not more_body and not body_processed:
+                                body_processed = True
+                                if body_bytes:
+                                    try:
+                                        request_data = json.loads(body_bytes.decode())
+                                        # Log the request in the GUI
+                                        request_logger.log_request(request_data)
+                                    except json.JSONDecodeError:
+                                        pass
+                        
+                        # Return the original message untouched
+                        return message
+                    
+                    # Replace the receive method
+                    request._receive = patched_receive
+                    
+                except Exception as e:
+                    logger.error(f"Error in request logging middleware: {str(e)}")
+            
+            # Let the request continue through the middleware stack
+            response = await call_next(request)
+            
+            # Only process responses from chat completions
+            if "/v1/chat/completions" in request.url.path:
+                is_streaming = response.headers.get("content-type") == "text/event-stream"
+                
+                # Handle streaming responses - just add GUI progress tracking
+                if is_streaming:
+                    # Find the matching request
+                    request_data = None
+                    for entry in request_logger.request_log:
+                        if entry.is_streaming and entry.status == "Pending":
+                            request_data = entry.request_data
+                            break
+                    
+                    # If we found a matching request, track streaming progress
+                    if request_data:
+                        # Wrap the streaming response to track progress
+                        original_iterator = response.body_iterator
+                        
+                        async def progress_tracking_iterator():
+                            chunk_count = 0
+                            last_update_time = time.time()
+                            update_interval = 0.1  # Update UI every 100ms
+                            
+                            try:
+                                async for chunk in original_iterator:
+                                    chunk_count += 1
+                                    
+                                    # Track progress in the GUI
+                                    current_time = time.time()
+                                    if current_time - last_update_time >= update_interval:
+                                        # Update UI more frequently
+                                        request_logger.update_streaming_status(request_data, chunk_count)
+                                        last_update_time = current_time
+                                    
+                                    # Check for completion
+                                    try:
+                                        chunk_str = chunk.decode()
+                                        if 'data: [DONE]' in chunk_str:
+                                            request_logger.update_streaming_status(request_data, chunk_count, done=True)
+                                    except:
+                                        pass
+                                    
+                                    yield chunk
+                                
+                                # Ensure we mark as complete if we reach the end
+                                request_logger.update_streaming_status(request_data, chunk_count, done=True)
+                            except Exception as e:
+                                logger.error(f"Error in streaming: {str(e)}")
+                                request_logger.log_error(request_data, str(e))
+                        
+                        # Return a new streaming response with our tracking
+                        return StreamingResponse(
+                            content=progress_tracking_iterator(),
+                            status_code=response.status_code,
+                            headers=dict(response.headers),
+                            media_type=response.media_type
+                        )
+                
+                # Handle non-streaming responses - capture and log the response
+                else:
+                    try:
+                        # Get the complete response body
+                        body_bytes = b""
+                        async for chunk in response.body_iterator:
+                            body_bytes += chunk
+                        
+                        # Try to parse the response as JSON
+                        try:
+                            response_data = json.loads(body_bytes.decode())
+                            
+                            # Find a pending request to match this response
+                            for entry in request_logger.request_log:
+                                if entry.status == "Pending" and not entry.is_streaming:
+                                    request_logger.log_response(entry.request_data, response_data)
+                                    break
+                        except:
+                            pass
+                        
+                        # Return a new response with the same data
+                        return Response(
+                            content=body_bytes,
+                            status_code=response.status_code,
+                            headers=dict(response.headers),
+                            media_type=response.media_type
+                        )
+                    except Exception as e:
+                        logger.error(f"Error capturing response: {str(e)}")
+            
+            # For non-chat completions or if there was an error, return original response
+            return response
     
     # Add API key validation middleware if api_key is provided
     if api_key:
