@@ -2,9 +2,13 @@
 
 **Connect Cursor AI to your local Ollama models**
 
+![OllamaLink Overview](documentation/ollamaLink_1.png)
+
 OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models. It comes in both GUI and CLI versions, offering flexibility in how you want to manage your Ollama connections.
 
 ## Features
+
+![OllamaLink Features](documentation/ollamaLink_2.png)
 
 - **Simple**: Minimal setup, just run and go
 - **Private**: Your code stays on your machine
@@ -61,6 +65,8 @@ Choose the appropriate URL based on your needs:
 
 ### 3. Configure Cursor Settings
 
+![Cursor Settings Configuration](documentation/ollamaLink_3.png)
+
 1. Open Cursor and access settings:
    - On macOS: Press `⌘ + ,` (Command + Comma)
    - On Windows/Linux: Press `Ctrl + ,`
@@ -87,6 +93,8 @@ Choose the appropriate URL based on your needs:
    - If you get an error, check the troubleshooting section below
 
 ### Common Setup Issues
+
+![Troubleshooting Guide](documentation/ollamaLink_4.png)
 
 1. **URL Error**:
    - Make sure the URL ends with `/v1`
