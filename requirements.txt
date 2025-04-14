@@ -1,0 +1,17 @@
+fastapi>=0.115.0
+uvicorn>=0.15.0
+starlette>=0.46.0
+pillow>=8.3.1
+python-multipart>=0.0.5
+aiofiles>=0.7.0
+requests>=2.26.0
+pyfiglet==1.0.2
+termcolor==2.3.0
+setuptools==65.6.3
+PyQt6==6.5.2
+
+# Optional packaging dependencies
+# For macOS packaging
+# py2app==0.28.6
+# For Windows packaging
+# pyinstaller==6.1.0

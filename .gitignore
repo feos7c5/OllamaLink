@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# Testing
+/coverage
+
+# Production
+/build
+/dist
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+
+
+# Environment files
+.DS_Store
+.env
+.env.dev
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
