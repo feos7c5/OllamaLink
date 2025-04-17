@@ -1,19 +1,21 @@
-"""
-Utility functions for OllamaLink.
-"""
 import re
-import os
 import sys
 import json
 import time
 import asyncio
 import logging
 import subprocess
+import tiktoken
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Set up logger
 logger = logging.getLogger("ollamalink")
+
+try:
+    cl100k_encoder = tiktoken.get_encoding("cl100k_base") 
+except Exception as e:
+    logger.warning(f"Failed to load tiktoken encoder: {str(e)}. Falling back to character-based estimation.")
+    cl100k_encoder = None
 
 def is_valid_url(url: str) -> bool:
     """Check if a URL is valid."""
@@ -65,7 +67,6 @@ async def start_cloudflared_tunnel(port, callback=None):
         The tunnel URL or None if the tunnel couldn't be started
     """
     try:
-        # Check if cloudflared is installed
         try:
             subprocess.run(
                 ["cloudflared", "version"],
@@ -76,7 +77,6 @@ async def start_cloudflared_tunnel(port, callback=None):
             logger.error("cloudflared not found or not working")
             return None
         
-        # Start the tunnel
         process = subprocess.Popen(
             ["cloudflared", "tunnel", "--url", f"http://localhost:{port}"],
             stdout=subprocess.PIPE,
@@ -85,7 +85,6 @@ async def start_cloudflared_tunnel(port, callback=None):
             bufsize=1
         )
         
-        # Wait for the tunnel URL
         url_pattern = re.compile(r'https://[a-zA-Z0-9_.-]+\.trycloudflare\.com')
         tunnel_url = None
         
@@ -141,3 +140,83 @@ def get_cloudflared_install_instructions():
         return "Windows: Download from https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation"
     else:  # Linux and others
         return "Linux: Download from https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation"
+
+def estimate_tokens(text: str) -> int:
+    """
+    Estimate token count using tiktoken if available, or character-based approximation.
+    
+    Args:
+        text: The text to estimate token count for
+        
+    Returns:
+        Estimated token count
+    """
+    if not text:
+        return 0
+        
+    if cl100k_encoder:
+        try:
+            return len(cl100k_encoder.encode(text))
+        except Exception as e:
+            logger.debug(f"Error estimating tokens with tiktoken: {str(e)}")
+    
+    # Fallback to character-based approximation
+    return max(1, int(len(text) / 3.5))
+
+def estimate_message_tokens(message: dict) -> int:
+    """
+    Estimate token count for a chat message using tiktoken when available.
+    
+    Args:
+        message: A message object with 'role' and 'content' keys
+        
+    Returns:
+        Estimated token count including role overhead
+    """
+    if not message or not isinstance(message, dict):
+        return 0
+    
+    role = message.get("role", "user")
+    content = message.get("content", "")
+    
+    if isinstance(content, list):
+        total = 4
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    total += estimate_tokens(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    total += 85
+            elif isinstance(item, str):
+                total += estimate_tokens(item)
+        return total + estimate_tokens(role)
+    
+    if isinstance(content, str):
+        if cl100k_encoder:
+            try:
+                tokens = len(cl100k_encoder.encode(content))
+                role_tokens = len(cl100k_encoder.encode(role))
+                return tokens + role_tokens + 4
+            except Exception:
+                pass
+                
+        return estimate_tokens(content) + 3 + 4
+    
+    return 10
+
+def count_tokens_in_messages(messages: list) -> int:
+    """
+    Count tokens in a full list of messages, accounting for the full message formatting.
+    
+    Args:
+        messages: List of message objects with 'role' and 'content' keys
+        
+    Returns:
+        Total token count including all formatting overhead
+    """
+    if not messages:
+        return 0
+        
+    tokens = sum(estimate_message_tokens(msg) for msg in messages)
+    
+    return tokens + 3

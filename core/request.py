@@ -1,18 +1,21 @@
 import logging
-import json
 import asyncio
 import httpx
 from typing import Dict, List, Any
+from .util import estimate_message_tokens, count_tokens_in_messages
 
 logger = logging.getLogger(__name__)
 
 class OllamaRequestHandler:
-    def __init__(self, ollama_endpoint: str, response_handler=None, max_retries: int = 3, chunk_size: int = 3):
+    def __init__(self, ollama_endpoint: str, response_handler=None, max_retries: int = 3, 
+                 max_tokens_per_chunk: int = 2000, chunk_overlap: int = 1):
         self.ollama_endpoint = ollama_endpoint
         self.max_retries = max_retries
-        self.chunk_size = chunk_size  # Reduced to 3 messages per chunk for better stability
-        self.cloudflare_timeout = 95  # Cloudflare free has ~100 second limit, stay under it
+        self.max_tokens_per_chunk = max_tokens_per_chunk
+        self.chunk_overlap = chunk_overlap
+        self.cloudflare_timeout = 95
         self.response_handler = response_handler
+        self.prefer_streaming = True
     
     async def _make_ollama_request(self, 
                                   request_data: Dict[str, Any], 
@@ -22,11 +25,33 @@ class OllamaRequestHandler:
         retry_count = 0
         model = request_data.get("model", "unknown")
         
+        is_streaming = request_data.get("stream", self.prefer_streaming)
+        if is_streaming:
+            request_data["stream"] = True
+        
         while retry_count < self.max_retries:
             try:
                 async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-                    logger.info(f"Requesting Ollama model: {model} (retry {retry_count+1}/{self.max_retries})")
-                    response = await client.post(url, json=request_data)
+                    logger.info(f"Requesting Ollama model: {model} (retry {retry_count+1}/{self.max_retries}) with stream={is_streaming}")
+                    
+                    if is_streaming:
+                        response = await client.post(
+                            url, 
+                            json=request_data,
+                            timeout=httpx.Timeout(
+                                connect=10.0,
+                                read=None,
+                                write=10.0,
+                                pool=None
+                            ),
+                            headers={
+                                "Accept": "text/event-stream",
+                                "Cache-Control": "no-cache",
+                                "X-Accel-Buffering": "no"
+                            }
+                        )
+                    else:
+                        response = await client.post(url, json=request_data)
                     
                     if response.status_code != 200:
                         error_msg = f"Ollama returned non-200 status: {response.status_code}"
@@ -61,12 +86,10 @@ class OllamaRequestHandler:
                         await asyncio.sleep(1)
                         continue
                         
-                    # For streaming requests, return the response directly
-                    if request_data.get("stream", False):
+                    if is_streaming:
                         logger.debug("Streaming response received from Ollama")
                         return response
                     
-                    # For non-streaming, parse the JSON response
                     try:
                         response_data = response.json()
                         logger.debug(f"Received response from Ollama for model {model}")
@@ -108,58 +131,66 @@ class OllamaRequestHandler:
         
         raise Exception(f"Failed to get response from Ollama after {self.max_retries} retries")
     
-    def _trim_request_size(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Reduce the size of a request by trimming message content."""
-        trimmed_request = request_data.copy()
-        messages = trimmed_request.get("messages", [])
-        
-        if len(messages) <= 2:
-            return trimmed_request
-        
-        # Keep system message and first/last user messages intact
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "system" or i == len(messages) - 1:
-                continue
-                
-            content = msg.get("content", "")
-            if len(content) > 1000:
-                messages[i]["content"] = content[:400] + " ... [content trimmed for performance] ... " + content[-400:]
-        
-        trimmed_request["messages"] = messages
-        return trimmed_request
-    
     def _chunk_messages(self, messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-        """Split messages into smaller chunks for processing."""
+        """
+        Split messages into smaller chunks based on token count.
+        Includes an overlap of messages between chunks for context preservation.
+        """
         system_message = None
-        user_messages = []
+        regular_messages = []
         
         for msg in messages:
             if msg.get("role") == "system":
                 system_message = msg
             else:
-                user_messages.append(msg)
+                regular_messages.append(msg)
         
-        if len(user_messages) <= self.chunk_size:
+        total_tokens = sum(estimate_message_tokens(msg) for msg in messages)
+        if total_tokens <= self.max_tokens_per_chunk:
             return [messages]
 
         chunked_messages = []
-        for i in range(0, len(user_messages), self.chunk_size):
-            if i + self.chunk_size >= len(user_messages) - 1:
-                chunk = user_messages[i:]
-                if system_message:
-                    chunk_with_system = [system_message] + chunk
-                    chunked_messages.append(chunk_with_system)
-                else:
-                    chunked_messages.append(chunk)
-                break
-            else:
-                chunk = user_messages[i:i + self.chunk_size]
-                if system_message:
-                    chunk_with_system = [system_message] + chunk
-                    chunked_messages.append(chunk_with_system)
-                else:
-                    chunked_messages.append(chunk)
+        current_chunk = []
+        current_tokens = 0
+        system_message_tokens = estimate_message_tokens(system_message) if system_message else 0
         
+        if system_message:
+            current_chunk.append(system_message)
+            current_tokens = system_message_tokens
+        
+        for i, msg in enumerate(regular_messages):
+            msg_tokens = estimate_message_tokens(msg)
+            
+            if current_tokens + msg_tokens > self.max_tokens_per_chunk and current_chunk:
+                if not current_chunk or (len(current_chunk) == 1 and system_message in current_chunk):
+                    current_chunk.append(msg)
+                
+                chunked_messages.append(current_chunk)
+                
+                current_chunk = []
+                current_tokens = 0
+                
+                if system_message:
+                    current_chunk.append(system_message)
+                    current_tokens = system_message_tokens
+                
+                overlap_start = max(0, i - self.chunk_overlap)
+                for j in range(overlap_start, i):
+                    overlap_msg = regular_messages[j]
+                    current_chunk.append(overlap_msg)
+                    current_tokens += estimate_message_tokens(overlap_msg)
+            
+            current_chunk.append(msg)
+            current_tokens += msg_tokens
+        
+        if current_chunk and (len(current_chunk) > 1 or system_message not in current_chunk):
+            chunked_messages.append(current_chunk)
+        
+        logger.info(f"Split {len(messages)} messages into {len(chunked_messages)} chunks based on token count")
+        for i, chunk in enumerate(chunked_messages):
+            chunk_tokens = sum(estimate_message_tokens(msg) for msg in chunk)
+            logger.info(f"Chunk {i+1}: {len(chunk)} messages, ~{chunk_tokens} tokens")
+            
         return chunked_messages
     
     async def _process_chunked_request(self, 
@@ -167,7 +198,7 @@ class OllamaRequestHandler:
         """Process a request by breaking it into smaller chunks if needed."""
         messages = original_request.get("messages", [])
         
-        if len(messages) <= self.chunk_size + 1:
+        if len(messages) <= self.max_tokens_per_chunk + 1:
             logger.info("Request is small enough to process directly")
             response = await self._make_ollama_request(original_request)
             
@@ -235,7 +266,7 @@ class OllamaRequestHandler:
                     
                     if i == len(chunked_messages) - 1:
                         if is_streaming:
-                            return response  # Return the raw response for streaming
+                            return response
                         
                         final_response = self.response_handler.parse_ollama_response(response)
                         final_response["prompt_eval_count"] = combined_results["prompt_eval_count"] + final_response.get("prompt_eval_count", 0)
@@ -273,19 +304,34 @@ class OllamaRequestHandler:
         timeout = min(request_data.get("timeout", 90), self.cloudflare_timeout)
         
         message_count = len(request_data.get("messages", []))
-        is_large_request = message_count > 6 or self._calculate_request_size(request_data) > 6000
-        is_stream = request_data.get("stream", False)
+        token_count = self._calculate_request_size(request_data)
+        is_large_request = message_count > 8 or token_count > 2500
+        
+        cursor_client = True
+        
+        if "stream" in request_data:
+            is_stream = request_data.get("stream", False)
+        else:
+            is_stream = self.prefer_streaming if cursor_client else False
+        
+        request_data["stream"] = is_stream
+        
+        logger.info(f"Request with {message_count} messages, estimated {token_count} tokens, streaming={is_stream}")
         
         try:
-            if is_stream and not is_large_request:
-                logger.info("Small streaming request, processing directly")
-                response = await self._make_ollama_request(request_data, timeout)
-                return response
-            elif is_stream and is_large_request:
+            if not is_large_request:
+                if is_stream:
+                    logger.info("Processing streaming request directly for real-time response")
+                    return await self._make_ollama_request(request_data, timeout)
+                else:
+                    logger.info("Processing non-streaming request directly")
+                    response = await self._make_ollama_request(request_data, timeout)
+                    return response
+            elif is_stream:
                 logger.info("Large streaming request, using specialized processing")
                 return await self._process_large_streaming_request(request_data)
             else:
-                logger.info(f"Using chunked processing for non-streaming request")
+                logger.info(f"Using chunked processing for large non-streaming request")
                 return await self._process_chunked_request(request_data)
                 
         except httpx.TimeoutException:
@@ -308,17 +354,18 @@ class OllamaRequestHandler:
             }
     
     def _calculate_request_size(self, request_data: Dict[str, Any]) -> int:
-        """Calculate approximate size of request in bytes."""
-        try:
-            return len(json.dumps(request_data))
-        except Exception:
-            total_size = 0
-            for msg in request_data.get("messages", []):
-                total_size += len(msg.get("content", ""))
-            return total_size
+        """
+        Calculate the approximate size of a request in tokens.
+        This is a fast estimation for chunking decisions, not an exact count.
+        """        
+        messages = request_data.get("messages", [])
+        return count_tokens_in_messages(messages)
     
     async def _process_large_streaming_request(self, request_data: Dict[str, Any]) -> httpx.Response:
-        """Special handling for large streaming requests to avoid Cloudflare timeouts."""
+        """
+        Special handling for large streaming requests to avoid Cloudflare timeouts.
+        Using token-based chunking with overlap between message chunks.
+        """
         messages = request_data.get("messages", [])
         
         system_message = None
@@ -327,27 +374,51 @@ class OllamaRequestHandler:
                 system_message = msg
                 break
         
-        recent_messages = messages[-min(5, len(messages)):]
+        total_tokens = sum(estimate_message_tokens(msg) for msg in messages)
+        logger.info(f"Large streaming request with {len(messages)} messages, ~{total_tokens} tokens")
         
-        if len(recent_messages) < len(messages) and system_message and system_message not in recent_messages:
-            recent_messages = [system_message] + recent_messages
-        
-        if len(recent_messages) < len(messages):
-            context_message = {
-                "role": "system",
-                "content": f"Note: This response is based on a reduced context of {len(recent_messages)} messages instead of the original {len(messages)} to ensure timely processing. The most recent messages were prioritized."
-            }
-            if system_message:
-                recent_messages.insert(1, context_message)
-            else:
-                recent_messages.insert(0, context_message)
+        if total_tokens > 4000:
+            logger.info(f"Request exceeds token limit ({total_tokens} tokens), reducing context")
             
-            logger.info(f"Reduced streaming request from {len(messages)} to {len(recent_messages)} messages to avoid timeout")
+            reduced_messages = []
+            current_tokens = 0
+            
+            if system_message:
+                reduced_messages.append(system_message)
+                current_tokens += estimate_message_tokens(system_message)
+            
+            for msg in reversed(messages):
+                if msg.get("role") == "system":
+                    continue
+                
+                msg_tokens = estimate_message_tokens(msg)
+                if current_tokens + msg_tokens <= self.max_tokens_per_chunk:
+                    reduced_messages.insert(1 if system_message else 0, msg)
+                    current_tokens += msg_tokens
+                else:
+                    break
+            
+            if len(reduced_messages) < len(messages):
+                context_message = {
+                    "role": "system",
+                    "content": f"Note: This response is based on a reduced context of {len(reduced_messages)} " +
+                              f"messages instead of the original {len(messages)} due to token limits. " +
+                              "The most recent messages were prioritized."
+                }
+                if system_message:
+                    reduced_messages.insert(1, context_message)
+                else:
+                    reduced_messages.insert(0, context_message)
+                
+                logger.info(f"Reduced streaming request from {len(messages)} to {len(reduced_messages)} messages " +
+                           f"({total_tokens} to ~{current_tokens} tokens)")
+            
+            modified_request = request_data.copy()
+            modified_request["messages"] = reduced_messages
+        else:
+            modified_request = request_data
         
-        modified_request = request_data.copy()
-        modified_request["messages"] = recent_messages
+        timeout = min(request_data.get("timeout", 90), 85)
         
-        timeout = min(request_data.get("timeout", 90), 85)  # Stay well under the 100s Cloudflare limit
-        
-        logger.info(f"Sending reduced streaming request with {len(recent_messages)} messages")
+        logger.info(f"Sending streaming request with {len(modified_request.get('messages', []))} messages")
         return await self._make_ollama_request(modified_request, timeout) 

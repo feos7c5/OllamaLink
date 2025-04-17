@@ -24,12 +24,10 @@ class OllamaRouter:
                 with open(config_path, 'r') as f:
                     config = json.load(f)
                 
-                # Load model mappings if available
                 if "ollama" in config and "model_mappings" in config["ollama"]:
                     self.model_mappings = config["ollama"]["model_mappings"]
                     logger.info(f"Loaded model mappings from config: {self.model_mappings}")
                     
-                    # Set default model from config if available
                     if "default" in self.model_mappings:
                         self.default_model = self.model_mappings["default"]
                         logger.info(f"Set default model from config: {self.default_model}")
@@ -40,9 +38,7 @@ class OllamaRouter:
     
     def _normalize_model_name(self, name: str) -> str:
         """Normalize model name for consistent comparison."""
-        # Remove tags like :latest
         name = re.sub(r':[^:]+$', '', name)
-        # Convert to lowercase to make comparisons easier
         return name.lower()
     
     def _fetch_models(self):
@@ -55,22 +51,17 @@ class OllamaRouter:
             if response.status_code == 200:
                 data = response.json()
                 if "models" in data and len(data["models"]) > 0:
-                    # Extract model names
                     self.available_models = [m["name"] for m in data["models"] if "name" in m]
                     
-                    # Set default model if not already set from config
                     if not self.default_model and self.available_models:
-                        # Check if the default from config is available
                         if hasattr(self, 'model_mappings') and "default" in self.model_mappings:
                             default_from_config = self.model_mappings["default"]
-                            # Try to find an exact or normalized match
                             for model in self.available_models:
                                 if (model == default_from_config or 
                                     self._normalize_model_name(model) == self._normalize_model_name(default_from_config)):
                                     self.default_model = model
                                     break
                         
-                        # If still no default, use first available model
                         if not self.default_model:
                             self.default_model = self.available_models[0]
                     
@@ -99,7 +90,6 @@ class OllamaRouter:
             logger.error(error_msg)
             self.connection_error = error_msg
         
-        # Only set fallback values if we loaded some config
         if hasattr(self, 'model_mappings') and "default" in self.model_mappings:
             self.default_model = self.model_mappings["default"]
             self.available_models = [self.default_model]
@@ -115,81 +105,65 @@ class OllamaRouter:
         """Map requested model to available Ollama model."""
         logger.info(f"Looking for model match: {requested_model}")
         
-        # Handle empty or None input
         if not requested_model:
             logger.warning("Empty model name requested, using default model")
             return self.default_model
             
-        # If we have no models (unlikely), return the requested model
         if not self.available_models:
             logger.warning("No models available, returning requested model as-is")
             return requested_model
             
-        # Check if there was a connection error
         if hasattr(self, 'connection_error') and self.connection_error:
             logger.warning(f"Cannot map model due to connection error: {self.connection_error}")
             return self.default_model
         
-        # First check exact match
         if requested_model in self.available_models:
             logger.info(f"Exact match found for {requested_model}")
             return requested_model
             
-        # Check with normalized name
         normalized_requested = self._normalize_model_name(requested_model)
         for model in self.available_models:
             if self._normalize_model_name(model) == normalized_requested:
                 logger.info(f"Normalized match found: {model}")
                 return model
         
-        # Special handling for unknown model formats (like claude-3-opus-20240229)
-        # Extract the base model name without version/dates
         base_model_match = re.match(r'^([a-zA-Z0-9_-]+(?:-[a-zA-Z0-9_-]+)*)(?:-\d+.*)?$', normalized_requested)
         if base_model_match:
             base_model = base_model_match.group(1)
-            # Try to find a model that matches the base name
             for model in self.available_models:
                 normalized_model = self._normalize_model_name(model)
                 if normalized_model.startswith(base_model):
                     logger.info(f"Base model match: {requested_model} → {model}")
                     return model
         
-        # Check model mappings from config
         if self.model_mappings:
-            # Check if requested model is a key in mappings (like gpt-4o)
             if requested_model in self.model_mappings and isinstance(self.model_mappings[requested_model], str):
                 target_model = self.model_mappings[requested_model]
                 norm_target = self._normalize_model_name(target_model)
                 
-                # First look for exact match
                 for available_model in self.available_models:
                     if self._normalize_model_name(available_model) == norm_target:
                         logger.info(f"Model mapping exact match: {requested_model} → {available_model}")
                         return available_model
                 
-                # Then look for match
                 for available_model in self.available_models:
                     normalized_available = self._normalize_model_name(available_model)
                     if normalized_available.startswith(norm_target) or normalized_available == norm_target:
                         logger.info(f"Model mapping match: {requested_model} → {available_model}")
                         return available_model
         
-        # If it's a standard model name, map to default
         standard_prefixes = ("gpt-", "claude-", "llama-", "gemini-", "mistral-", "meta-", "qwen-", "phi-")
         if any(normalized_requested.startswith(prefix) for prefix in standard_prefixes):
             logger.info(f"Standard model name {requested_model} → using default: {self.default_model}")
             return self.default_model
         
-        # If it has 'gpt-' prefix, try the unprefixed version
         if normalized_requested.startswith("gpt-"):
-            base_name = normalized_requested[4:]  # Remove 'gpt-' prefix
+            base_name = normalized_requested[4:]
             for model in self.available_models:
-                # Check if any available model contains the base name
                 if base_name in self._normalize_model_name(model):
                     logger.info(f"Found model containing {base_name}: {model}")
                     return model
         
-        # Fallback to default model and log that it's a potential issue
         logger.warning(f"No match found for {requested_model}, using default: {self.default_model}")
         logger.warning(f"This model mapping might not work if {self.default_model} isn't loaded in Ollama")
         return self.default_model
@@ -198,9 +172,8 @@ class OllamaRouter:
         """Get list of models in OpenAI-compatible format."""
         models_list = []
         
-        # Add only model mappings from config as available models
         for standard_model, _ in self.model_mappings.items():
-            if standard_model != "default":  # Skip the default entry
+            if standard_model != "default":
                 models_list.append({
                     "id": standard_model,
                     "object": "model",

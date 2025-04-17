@@ -15,8 +15,6 @@ OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models
 - **Real-time Monitoring**: Track requests and responses in the GUI
 - **Secure**: Optional API key support for added security
 
-![OllamaLink Overview](documentation/ollamaLink_1.png)
-
 ## Quick Start
 
 1. **Install Ollama**:
@@ -63,8 +61,6 @@ Choose the appropriate URL based on your needs:
 
 ### 3. Configure Cursor Settings
 
-![OllamaLink Setup](documentation/ollamaLink_2.png)
-
 1. Open Cursor and access settings:
    - On macOS: Press `⌘ + ,` (Command + Comma)
    - On Windows/Linux: Press `Ctrl + ,`
@@ -89,12 +85,6 @@ Choose the appropriate URL based on your needs:
    - Click the "Test Connection" button
    - You should see a success message
    - If you get an error, check the troubleshooting section below
-
-6. Use Model
-
-![OllamaLink Use](documentation/ollamaLink_3.png)
-
-![OllamaLink Request / Response](documentation/ollamaLink_4.png)
 
 ### Common Setup Issues
 

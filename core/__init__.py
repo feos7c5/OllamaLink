@@ -1,11 +1,11 @@
 """
-OllamaLink - A connector for Ollama models in Cursor AI
-
-This package provides a bridge that allows Cursor AI to communicate with local Ollama models.
+OllamaLink Core Module - Bridge between OpenAI API and Ollama
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
-from .router import OllamaRouter
+from .api import create_api
 from .request import OllamaRequestHandler
 from .response import OllamaResponseHandler
+from .router import OllamaRouter
+from .util import is_valid_url, load_config, estimate_tokens, estimate_message_tokens

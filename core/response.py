@@ -2,14 +2,15 @@ import logging
 import json
 import time
 import random
-from typing import Dict, List, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator
 import httpx
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class OllamaResponseHandler:
     def __init__(self):
-        self.cloudflare_timeout = 95  # Cloudflare free has ~100 second limit, stay under it
+        self.cloudflare_timeout = 95
     
     def parse_ollama_response(self, response: httpx.Response) -> Dict[str, Any]:
         """Parse the Ollama response, handling multi-line JSON."""
@@ -42,12 +43,10 @@ class OllamaResponseHandler:
         if "message" in response and "content" in response["message"]:
             assistant_content = response["message"]["content"]
         
-        # Log token usage
         prompt_tokens = response.get("prompt_eval_count", 0)
         completion_tokens = response.get("eval_count", 0)
         logger.info(f"Token usage - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {prompt_tokens + completion_tokens}")
         
-        # Create OpenAI-compatible response
         openai_response = {
             "id": f"chatcmpl-{random.randint(10000, 99999)}",
             "object": "chat.completion",
@@ -80,12 +79,13 @@ class OllamaResponseHandler:
     async def stream_response(self, 
                            response: httpx.Response, 
                            requested_model: str) -> AsyncGenerator[str, None]:
-        """Process a streaming response from Ollama into OpenAI format."""
+        """Process a streaming response from Ollama into OpenAI format for real-time delivery."""
         try:
             chunk_index = 0
             message_id = f"chatcmpl-{random.randint(10000, 99999)}"
             created_time = int(time.time())
             last_yield_time = time.time()
+            buffer = ""
         
             role_event = {
                 "id": message_id,
@@ -103,85 +103,46 @@ class OllamaResponseHandler:
                 ]
             }
             yield f"data: {json.dumps(role_event)}\n\n"
-            last_yield_time = time.time()
-            buffer = ""
+            await asyncio.sleep(0.01)
+            
+            keepalive_interval = 5
+            
             async for line in response.aiter_lines():
                 if not line.strip():
                     continue
                 
                 current_time = time.time()
-                if current_time - last_yield_time > 45: 
-                    logger.info("Sending keepalive comment to maintain connection")
+                
+                if current_time - last_yield_time > keepalive_interval:
                     yield f": keepalive {int(current_time)}\n\n"
                     last_yield_time = current_time
                 
-                # Handle potential multi-line JSON in a single line
-                if "\n" in line:
-                    lines = line.split("\n")
-                    logger.debug(f"Splitting multi-line content into {len(lines)} parts")
-                    for subline in lines:
-                        if not subline.strip():
-                            continue
-                        try:
-                            chunk = json.loads(subline)
-                            
-                            if "message" in chunk and "content" in chunk["message"]:
-                                content_piece = chunk["message"]["content"]
-                                
-                                event_data = {
-                                    "id": message_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": requested_model,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": content_piece
-                                            },
-                                            "finish_reason": None
-                                        }
-                                    ]
-                                }
-                                
-                                chunk_index += 1
-                                yield f"data: {json.dumps(event_data)}\n\n"
-                                last_yield_time = time.time()
-                        except:
-                            logger.debug(f"Failed to process stream subline: {subline[:50]}...")
-                    continue
-                
-                # Process single line
                 try:
                     chunk = json.loads(line)
                     
                     if "message" in chunk and "content" in chunk["message"]:
-                        content_piece = chunk["message"]["content"]
-                        
-                        event_data = {
-                            "id": message_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_time,
-                            "model": requested_model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "content": content_piece
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-                        
-                        chunk_index += 1
-                        try:
+                        content = chunk["message"]["content"]
+                        if content:
+                            event_data = {
+                                "id": message_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": requested_model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": content
+                                        },
+                                        "finish_reason": None
+                                    }
+                                ]
+                            }
+                            chunk_index += 1
                             yield f"data: {json.dumps(event_data)}\n\n"
-                            last_yield_time = time.time()
-                        except Exception as e:
-                            logger.error(f"Error yielding content chunk: {str(e)}")
+                            last_yield_time = current_time
+                            await asyncio.sleep(0.001)
                     
-                    # Check for done flag
                     if chunk.get("done", False):
                         finish_event = {
                             "id": message_id,
@@ -196,59 +157,119 @@ class OllamaResponseHandler:
                                 }
                             ]
                         }
-                        try:
-                            yield f"data: {json.dumps(finish_event)}\n\n"
-                            last_yield_time = time.time()
-                        except Exception as e:
-                            logger.error(f"Error yielding finish event: {str(e)}")
+                        yield f"data: {json.dumps(finish_event)}\n\n"
+                        await asyncio.sleep(0.01)
                 
-                except json.JSONDecodeError as e:
-                    buffer += line
-                    if len(buffer) > 10000:  # Prevent buffer from growing too large
-                        logger.warning(f"Stream buffer too large ({len(buffer)} chars), clearing")
-                        buffer = ""
- 
-                    try:
-                        chunk = json.loads(buffer)
-                        buffer = ""
-                        
-                        if "message" in chunk and "content" in chunk["message"]:
-                            content_piece = chunk["message"]["content"]
-                            event_data = {
-                                "id": message_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_time,
-                                "model": requested_model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "content": content_piece
-                                        },
-                                        "finish_reason": None
+                except json.JSONDecodeError:
+                    sublines = [l for l in line.split("\n") if l.strip()]
+                    for subline in sublines:
+                        try:
+                            subchunk = json.loads(subline)
+                            if "message" in subchunk and "content" in subchunk["message"]:
+                                content = subchunk["message"]["content"]
+                                if content:
+                                    event_data = {
+                                        "id": message_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": requested_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": content
+                                                },
+                                                "finish_reason": None
+                                            }
+                                        ]
                                     }
-                                ]
-                            }
-                            
-                            chunk_index += 1
-                            yield f"data: {json.dumps(event_data)}\n\n"
-                            last_yield_time = time.time()
-                    except:
-                        logger.debug(f"Couldn't parse JSON, buffering: {line[:50]}...")
-                        continue
-                    
+                                    chunk_index += 1
+                                    yield f"data: {json.dumps(event_data)}\n\n"
+                                    last_yield_time = current_time
+                                    await asyncio.sleep(0.001)
+                        except json.JSONDecodeError:
+                            buffer += subline
+                            try:
+                                subchunk = json.loads(buffer)
+                                buffer = ""
+                                if "message" in subchunk and "content" in subchunk["message"]:
+                                    content = subchunk["message"]["content"]
+                                    if content:
+                                        event_data = {
+                                            "id": message_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_time,
+                                            "model": requested_model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": content
+                                                    },
+                                                    "finish_reason": None
+                                                }
+                                            ]
+                                        }
+                                        chunk_index += 1
+                                        yield f"data: {json.dumps(event_data)}\n\n"
+                                        last_yield_time = current_time
+                                        await asyncio.sleep(0.001)
+                            except json.JSONDecodeError:
+                                if len(buffer) > 50:
+                                    event_data = {
+                                        "id": message_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": requested_model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": buffer
+                                                },
+                                                "finish_reason": None
+                                            }
+                                        ]
+                                    }
+                                    chunk_index += 1
+                                    yield f"data: {json.dumps(event_data)}\n\n"
+                                    last_yield_time = current_time
+                                    buffer = ""
+                                    await asyncio.sleep(0.001)
+                            except Exception as e:
+                                logger.error(f"Error processing buffered content: {str(e)}")
+                                buffer = ""
+                        except Exception as e:
+                            logger.error(f"Error processing line segment: {str(e)}")
                 except Exception as e:
-                    logger.error(f"Error processing stream chunk: {str(e)}")
-                    continue
+                    logger.error(f"Error processing chunk: {str(e)}")
+            
+            if buffer:
+                event_data = {
+                    "id": message_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": requested_model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": buffer
+                            },
+                            "finish_reason": None
+                        }
+                    ]
+                }
+                yield f"data: {json.dumps(event_data)}\n\n"
             
             logger.info(f"Stream completed with {chunk_index} chunks")
             yield "data: [DONE]\n\n"
             
         except Exception as e:
-            logger.error(f"Error in stream processing: {str(e)}", exc_info=True)
+            logger.error(f"Stream error: {str(e)}", exc_info=True)
             error_event = {
                 "error": {
-                    "message": f"Stream processing error: {str(e)}",
+                    "message": f"Stream error: {str(e)}",
                     "type": "stream_error"
                 }
             }

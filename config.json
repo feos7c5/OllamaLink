@@ -5,9 +5,10 @@
     "ollama": {
         "endpoint": "http://localhost:11434",
         "model_mappings": {
-            "default": "Qwen2.5:latest",
-            "qwen2.5": "qwen2.5",
-            "qwen2.5-coder": "qwen2.5-coder"
+            "default": "Qwen2.5",
+            "qwen2.5": "Qwen2.5",
+            "qwen2.5-coder": "Qwen2.5-coder",
+            "qwen2.5-r1": "cyberuser42/DeepSeek-R1-Distill-Qwen-7B"
         }
     },
     "server": {
