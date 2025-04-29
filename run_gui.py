@@ -3,51 +3,68 @@ import json
 import logging
 import time
 import datetime
-import base64
 import subprocess
+import socket
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QLineEdit,
-    QComboBox, QCheckBox, QGroupBox, QSplitter, QGridLayout, QHeaderView
+    QComboBox, QCheckBox, QGroupBox, QSplitter, QGridLayout, QHeaderView, QSpinBox, QFrame
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QIcon, QFont, QTextCursor, QPixmap, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
+from PyQt6.QtGui import QFont, QTextCursor, QColor
 
-# Import OllamaLink components
 from core.router import OllamaRouter
-from core.util import load_config, start_cloudflared_tunnel, is_cloudflared_installed, get_cloudflared_install_instructions
+from core.util import load_config, start_localhost_run_tunnel
 import core.api as api
 
 import uvicorn
-from fastapi import Request, Response
-from starlette.requests import ClientDisconnect
 import asyncio
+import httpx
+import re
+import threading
+import platform
 
-# Set up logging
+class LoggerTextSignal(QObject):
+    """Simple QObject with a signal to safely pass logging messages across threads"""
+    signal = pyqtSignal(str, str)
+
 class QTextEditLogger(logging.Handler):
     def __init__(self, text_edit):
         super().__init__()
         self.text_edit = text_edit
         self.text_edit.setReadOnly(True)
-        self.text_edit.setFont(QFont("Monospace", 9))
+        # Use Courier font instead of Monospace (more widely available)
+        self.text_edit.setFont(QFont("Courier", 9))
         self.formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+        # Add a signal to safely update the text edit from any thread
+        self.signal = LoggerTextSignal()
+        self.signal.signal.connect(self.update_text_edit)
 
     def emit(self, record):
-        msg = self.formatter.format(record)
-        # Apply color based on log level
-        if record.levelname == 'ERROR':
-            self.text_edit.append(f'<span style="color: #f44336;">{msg}</span>')
-        elif record.levelname == 'WARNING':
-            self.text_edit.append(f'<span style="color: #FF9800;">{msg}</span>')
-        elif record.levelname == 'INFO':
-            self.text_edit.append(f'<span style="color: #2196F3;">{msg}</span>')
-        else:
-            self.text_edit.append(msg)
-        
-        # Scroll to bottom
-        cursor = self.text_edit.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.text_edit.setTextCursor(cursor)
+        try:
+            msg = self.formatter.format(record)
+            # Use signal to safely update the UI from any thread
+            self.signal.signal.emit(record.levelname, msg)
+        except Exception as e:
+            print(f"Error in logger emit: {str(e)}")
+    
+    def update_text_edit(self, level, message):
+        try:
+            if level == 'ERROR':
+                self.text_edit.append(f'<span style="color: #f44336;">{message}</span>')
+            elif level == 'WARNING':
+                self.text_edit.append(f'<span style="color: #FF9800;">{message}</span>')
+            elif level == 'INFO':
+                self.text_edit.append(f'<span style="color: #2196F3;">{message}</span>')
+            else:
+                self.text_edit.append(message)
+            
+            # Keep the latest messages visible by moving cursor to the end
+            cursor = self.text_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.text_edit.setTextCursor(cursor)
+        except Exception as e:
+            print(f"Error updating text edit: {str(e)}")
 
 
 class RequestLogEntry:
@@ -60,6 +77,8 @@ class RequestLogEntry:
         self.messages = request_data.get("messages", []) if request_data else []
         self.is_streaming = request_data.get("stream", False) if request_data else False
         self.completed_chunks = 0
+        self.start_time = time.time()
+        self.last_update_time = None
         
         # Set initial status
         if response_data:
@@ -70,11 +89,35 @@ class RequestLogEntry:
         else:
             self.status = "Pending"
 
+    def update_chunk_count(self, count):
+        """Update the chunk count and last update time"""
+        self.completed_chunks = count
+        self.last_update_time = time.time()
+        return self
+    
+    def mark_completed(self):
+        """Mark the request as completed"""
+        self.status = "Completed"
+        self.last_update_time = time.time()
+        return self
+    
+    def mark_error(self, error_message=None):
+        """Mark the request as errored"""
+        self.status = "Error"
+        self.last_error = error_message
+        if error_message:
+            if not self.response_data:
+                self.response_data = {}
+            self.response_data["error"] = {"message": error_message}
+        self.last_update_time = time.time()
+        return self
+
 
 class ServerThread(QThread):
     """Thread to run the uvicorn server"""
     update_signal = pyqtSignal(str)
     tunnel_url_signal = pyqtSignal(str)
+    request_update_signal = pyqtSignal()
     
     def __init__(self, port, host, ollama_endpoint, use_tunnel, router=None, api_key=None):
         super().__init__()
@@ -90,320 +133,216 @@ class ServerThread(QThread):
         self.request_log = []
         
     def run(self):
-
-        # Create the custom app
-        self.app = api.create_api(ollama_endpoint=self.ollama_endpoint, api_key=self.api_key)
+        class SignalHandler(logging.Handler):
+            def __init__(self, signal):
+                super().__init__()
+                self.signal = signal
+                self.formatter = logging.Formatter('%(levelname)s - %(name)s - %(message)s')
+                
+            def emit(self, record):
+                msg = self.formatter.format(record)
+                self.signal.emit(msg)
         
-        # Add middleware to capture requests/responses
-        @self.app.middleware("http")
-        async def log_requests(request: Request, call_next):
-            # Log the request
+        log_handler = SignalHandler(self.update_signal)
+        log_handler.setLevel(logging.INFO)
+        logging.getLogger("core").addHandler(log_handler)
+        
+        def request_callback(data):
             try:
-                # Clone the request body to avoid consuming it
-                body_bytes = await request.body()
-                request_data = {}
+                data_type = data.get("type", "")
                 
-                # Try to parse as JSON
-                try:
-                    request_data = json.loads(body_bytes.decode())
-                except json.JSONDecodeError:
-                    # Not JSON or empty body
-                    request_data = {"non_json_body": True}
-                
-                # Create a new request with the same body
-                async def receive():
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                
-                # Replace the receive method to return the stored body
-                request._receive = receive
-                
-                # Extract the path for endpoint detection
-                path = request.url.path
-                is_chat_completion = "/v1/chat/completions" in path
-                
-                # Store request
-                if request_data:
+                if data_type == "request":
+                    request_data = data.get("request", {})
                     self.update_signal.emit(f"Request: {json.dumps(request_data, indent=2)}")
+                    
                     entry = RequestLogEntry(request_data)
                     
-                    # Better model detection
-                    if is_chat_completion and (not entry.model or entry.model == "unknown"):
-                        # Try to identify model from the router if available
-                        if hasattr(self, 'router') and self.router:
-                            if "model" in request_data:
-                                # Use the router to resolve the model name
-                                resolved_model = self.router.get_model_name(request_data["model"])
-                                entry.model = resolved_model
-                            else:
-                                # No model specified, use default model
-                                entry.model = self.router.default_model or "unknown"
+                    model = request_data.get('model', 'unknown')
+                    from core.router import OllamaRouter
+                    router = OllamaRouter(ollama_endpoint=self.ollama_endpoint)
+                    entry.model = router.get_model_name(model)
                     
                     self.request_log.append(entry)
+                    self.request_update_signal.emit()
+                    
+                elif data_type == "response":
+                    request_data = data.get("request", {})
+                    response_data = data.get("response", {})
+                    
+                    for entry in self.request_log:
+                        if entry.request_data == request_data:
+                            entry.response_data = response_data
+                            entry.mark_completed()
+                            response_str = json.dumps(response_data)
+                            log_str = response_str[:100] + "..." if len(response_str) > 100 else response_str
+                            self.update_signal.emit(f"Response: {log_str}")
+                            self.request_update_signal.emit()
+                            break
                 
-                # Process request (with timeout)
-                try:
-                    response = await asyncio.wait_for(call_next(request), timeout=120)  # 2 minute timeout
+                elif data_type == "stream_start":
+                    request_data = data.get("request", {})
                     
-                    # Check if this is a streaming response
-                    is_streaming = False
-                    if request_data and is_chat_completion:
-                        is_streaming = request_data.get("stream", False)
+                    for entry in self.request_log:
+                        if entry.request_data == request_data:
+                            entry.is_streaming = True
+                            self.update_signal.emit(f"Stream started for request")
+                            self.request_update_signal.emit()
+                            break
+                
+                elif data_type == "stream_chunk":
+                    request_data = data.get("request", {})
+                    chunk_count = data.get("chunk_count", 0)
                     
-                    if is_streaming:
-                        # For streaming responses, we need to process each chunk
-                        # and mark the request as completed after all chunks
-                        chunks = []
-                        entry_to_update = None
-                        
-                        # Find the request entry
-                        for entry in self.request_log:
-                            if entry.request_data == request_data:
-                                entry_to_update = entry
-                                break
-                        
-                        # Create a modified iterator to capture chunks and update status
-                        async def capture_chunks():
-                            nonlocal entry_to_update
-                            chunk_count = 0
-                            
-                            async for chunk in response.body_iterator:
-                                chunks.append(chunk)
-                                chunk_count += 1
-                                
-                                # Update the entry with progress
-                                if entry_to_update:
-                                    entry_to_update.completed_chunks = chunk_count
-                                    
-                                    # Try to parse as JSON to detect final chunk
-                                    try:
-                                        chunk_data = json.loads(chunk.decode())
-                                        if chunk_data.get("choices", [{}])[0].get("finish_reason") is not None:
-                                            entry_to_update.status = "Completed"
-                                    except:
-                                        pass
-                                
-                                yield chunk
-                            
-                            # Stream completed - ensure the status is updated
-                            if entry_to_update:
-                                entry_to_update.status = "Completed"
-                                self.update_signal.emit(f"Streaming request completed with {chunk_count} chunks")
-                        
-                        # Return a modified response with our chunk capturing iterator
-                        return Response(
-                            content=capture_chunks(),
-                            status_code=response.status_code,
-                            headers=dict(response.headers),
-                            media_type=response.media_type,
-                            background=response.background
-                        )
-                    else:
-                        # Non-streaming response - process as before
-                        response_body = b""
-                        async for chunk in response.body_iterator:
-                            response_body += chunk
-                        
-                        # Try to parse as JSON for completions
-                        if is_chat_completion:
-                            try:
-                                response_data = json.loads(response_body.decode())
-                                
-                                # Update request entry with response
-                                if request_data:
-                                    for entry in self.request_log:
-                                        if entry.request_data == request_data:
-                                            entry.response_data = response_data
-                                            entry.status = "Completed"
-                                            break
-                                
-                                self.update_signal.emit(f"Response: {json.dumps(response_data, indent=2)}")
-                            except json.JSONDecodeError:
-                                self.update_signal.emit(f"Response: {response_body.decode()}")
-                        
-                        # Return the response with the body we already consumed
-                        return Response(
-                            content=response_body,
-                            status_code=response.status_code,
-                            headers=dict(response.headers),
-                            media_type=response.media_type
-                        )
+                    for entry in self.request_log:
+                        if entry.request_data == request_data:
+                            entry.update_chunk_count(chunk_count)
+                            self.update_signal.emit(f"Received {chunk_count} chunks")
+                            self.request_update_signal.emit()
+                            break
+                
+                elif data_type == "stream_end":
+                    request_data = data.get("request", {})
+                    chunk_count = data.get("chunk_count", 0)
                     
-                except asyncio.TimeoutError:
-                    # Request took too long
-                    self.update_signal.emit("Request timed out (taking longer than 2 minutes)")
+                    for entry in self.request_log:
+                        if entry.request_data == request_data:
+                            entry.update_chunk_count(chunk_count)
+                            entry.mark_completed()
+                            self.update_signal.emit(f"Stream completed with {chunk_count} chunks")
+                            self.request_update_signal.emit()
+                            break
+                
+                elif data_type == "error":
+                    error = data.get("error", "Unknown error")
+                    self.update_signal.emit(f"Error: {error}")
                     
-                    # Mark the request as timed out
+                    request_data = data.get("request", {})
                     if request_data:
                         for entry in self.request_log:
                             if entry.request_data == request_data:
-                                entry.status = "Timeout"
+                                entry.mark_error(error)
+                                self.request_update_signal.emit()
                                 break
-                    
-                    return Response(
-                        content=json.dumps({
-                            "error": {
-                                "message": "Request timed out. The model is taking too long to respond.",
-                                "type": "timeout",
-                                "code": 504
-                            }
-                        }),
-                        status_code=504,
-                        media_type="application/json"
-                    )
-                    
-            except ClientDisconnect:
-                # Client disconnected, just log it
-                self.update_signal.emit("Client disconnected before response was complete")
-                return Response(
-                    content=json.dumps({
-                        "error": {
-                            "message": "Client disconnected",
-                            "type": "client_disconnect",
-                            "code": 499
-                        }
-                    }),
-                    status_code=499,
-                    media_type="application/json"
-                )
+                    else:
+                        for entry in self.request_log:
+                            if entry.status == "Pending":
+                                entry.mark_error(error)
+                                self.request_update_signal.emit()
                 
             except Exception as e:
-                # Log the error
-                self.update_signal.emit(f"Error capturing request/response: {str(e)}")
-                return await call_next(request)
+                self.update_signal.emit(f"Error processing request callback: {str(e)}")
         
-        # Add exception handler for client disconnects
-        @self.app.exception_handler(ClientDisconnect)
-        async def client_disconnect_handler(request, exc):
-            self.update_signal.emit("Client disconnected")
-            return Response(
-                content=json.dumps({
-                    "error": {
-                        "message": "Client disconnected",
-                        "type": "client_disconnect",
-                        "code": 499
-                    }
-                }),
-                status_code=499,
-                media_type="application/json"
+        try:
+            # Create API
+            self.app = api.create_api(
+                ollama_endpoint=self.ollama_endpoint,
+                api_key=self.api_key,
+                request_callback=request_callback
             )
-        
-        # Configure and start the server
-        config = uvicorn.Config(
-            self.app,
-            host=self.host,
-            port=self.port,
-            log_level="warning"
-        )
-        self.server = uvicorn.Server(config)
-        self.running = True
-        
-        # Start tunnel if needed
-        if self.use_tunnel:
-            # Create a separate task to run the tunnel
-            async def start_gui_cloudflared_tunnel():
-                try:
-                    # Check if cloudflared is installed
-                    if not is_cloudflared_installed():
-                        self.update_signal.emit("cloudflared not found. Install instructions:")
-                        self.update_signal.emit(get_cloudflared_install_instructions())
-                        return
-
-                    self.update_signal.emit("Starting cloudflared tunnel...")
-                    
-                    # Custom callback for GUI to update the UI
-                    def tunnel_url_callback(url):
-                        self.update_signal.emit(f"Tunnel started at: {url}")
-                        self.tunnel_url_signal.emit(url)
-                    
-                    result = await start_cloudflared_tunnel(self.port, callback=tunnel_url_callback)
-                    
-                    if not result:
-                        self.update_signal.emit("Could not get tunnel URL within timeout period.")
-                        return
-                    
-                    tunnel_url, process = result
-                    
-                    # Keep the process running as long as the server is
-                    watchdog_time = time.time()
-                    while self.running:
-                        # Check if process is still alive
-                        if process.poll() is not None:
-                            self.update_signal.emit("CloudFlare tunnel process terminated unexpectedly")
-                            # Try to restart if we're still running
-                            if self.running:
-                                self.update_signal.emit("Attempting to restart CloudFlare tunnel...")
-                                result = await start_cloudflared_tunnel(self.port, callback=tunnel_url_callback)
-                                if result:
-                                    tunnel_url, process = result
-                        
-                        # Periodic keepalive log to show tunnel is still active
-                        current_time = time.time()
-                        if current_time - watchdog_time > 60:  # Log every minute
-                            self.update_signal.emit("CloudFlare tunnel watchdog: still active")
-                            watchdog_time = current_time
-                            
-                        await asyncio.sleep(5)
-                    
-                    # Cleanup process when done
-                    if process and process.poll() is None:
-                        self.update_signal.emit("Stopping CloudFlare tunnel...")
-                        # Try graceful termination first
-                        try:
-                            process.terminate()
-                            try:
-                                process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                self.update_signal.emit("Tunnel not responding to termination, forcing kill...")
-                                process.kill()
-                        except Exception as e:
-                            self.update_signal.emit(f"Error stopping tunnel: {str(e)}")
-                    
-                except Exception as e:
-                    self.update_signal.emit(f"Error with tunnel: {str(e)}")
             
-            # Run both the server and tunnel
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.create_task(start_gui_cloudflared_tunnel())
-            loop.run_until_complete(self.server.serve())
-        else:
-            # Just run the server without tunnel
-            asyncio.run(self.server.serve())
+            config = uvicorn.Config(
+                self.app,
+                host=self.host,
+                port=self.port,
+                log_level="warning"
+            )
+            self.server = uvicorn.Server(config)
+            self.running = True
+            
+            if self.use_tunnel:
+                async def start_gui_tunnel():
+                    try:
+                        self.update_signal.emit("Starting localhost.run tunnel...")
+                        
+                        result = await start_localhost_run_tunnel(self.port)
+                        
+                        if not result:
+                            self.update_signal.emit("Could not get tunnel URL within timeout period.")
+                            self.update_signal.emit("Will retry in 10 seconds...")
+                            await asyncio.sleep(10)
+                            
+                            self.update_signal.emit("Retrying tunnel connection...")
+                            result = await start_localhost_run_tunnel(self.port)
+                            
+                            if not result:
+                                self.update_signal.emit("Failed to establish tunnel after retry. Please check your network connection.")
+                                return
+                        
+                        tunnel_url, process = result
+                        
+                        if tunnel_url.startswith("https://admin.localhost.run"):
+                            self.update_signal.emit("Error: Received admin URL instead of tunnel URL. This will not work with Cursor AI.")
+                            self.update_signal.emit("Please retry with a different method.")
+
+                            if process and process.poll() is None:
+                                try:
+                                    process.terminate()
+                                except:
+                                    pass
+                            return
+                        
+                        self.update_signal.emit(f"Tunnel successfully started!")
+                        self.update_signal.emit(f"Tunnel URL: {tunnel_url}")
+                        self.tunnel_url_signal.emit(tunnel_url)
+
+                        watchdog_time = time.time()
+                        while self.running:
+                            if process.poll() is not None:
+                                self.update_signal.emit("Tunnel process terminated unexpectedly")
+                                if self.running:
+                                    self.update_signal.emit("Attempting to restart localhost.run tunnel...")
+                                    result = await start_localhost_run_tunnel(self.port)
+                                    if result:
+                                        new_tunnel_url, process = result
+                                        
+                                        if not new_tunnel_url.startswith("https://admin.localhost.run"):
+                                            tunnel_url = new_tunnel_url
+                                            self.tunnel_url_signal.emit(tunnel_url)
+                                            self.update_signal.emit(f"Tunnel restarted successfully!")
+                                            self.update_signal.emit(f"New tunnel URL: {tunnel_url}")
+                                        else:
+                                            self.update_signal.emit("Error: Received admin URL on restart. This will not work with Cursor AI.")
+                            
+                            current_time = time.time()
+                            if current_time - watchdog_time > 60:
+                                self.update_signal.emit("Tunnel status: Active and running")
+                                watchdog_time = current_time
+                                
+                            await asyncio.sleep(5)
+                        
+                        if process and process.poll() is None:
+                            self.update_signal.emit("Stopping localhost.run tunnel...")
+                            try:
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    self.update_signal.emit("Tunnel not responding to termination, forcing kill...")
+                                    process.kill()
+                            except Exception as e:
+                                self.update_signal.emit(f"Error stopping tunnel: {str(e)}")
+                        
+                    except Exception as e:
+                        self.update_signal.emit(f"Error with tunnel: {str(e)}")
+                
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.create_task(start_gui_tunnel())
+                    loop.run_until_complete(self.server.serve())
+                except Exception as e:
+                    self.update_signal.emit(f"Error in server/tunnel loop: {str(e)}")
+            else:
+                try:
+                    asyncio.run(self.server.serve())
+                except Exception as e:
+                    self.update_signal.emit(f"Error running server: {str(e)}")
+        except Exception as e:
+            self.update_signal.emit(f"Server startup error: {str(e)}")
     
     def stop(self):
         """Safely stop the server thread"""
         self.running = False
-        # The actual server will be stopped in the run method
-        # This just signals that we should stop
-
-
-# Simple Ollama icon (base64 encoded for portability)
-OLLAMA_ICON = """
-iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAMAAAD04JH5AAAABGdBTUEAALGPC/xhBQAAAAFzUkdCAK7OHOk
-AAABL1BMVEX///8AAADMzMz4+PgiIiLb29tERET09PSCgoLGxsYUFBTi4uIJCQlSUlKysrI5OTnx8fHp6emio
-qIrKytlZWW5ubk9PT1bW1uOjo4TnZ0tmZnIjY0hnp4ckJBjjY0bgoIlk5MbiorChob3i4vdl5f97u7DKCjadH
-Talpa0TEzrKyvrFhbkWVnwPT3LNzfAaWnGXl7kj4/Qvr7O6uru7uiVFSQYmKKV1dXnJxRlJRHl5dAjIxJhYV
-1jY1qiIhBh4d6hYWzLS1jiIhKeHhFdnZfg4NbfHxegoJZfn5Td3dPhYVMf39Lc3NHeXlBcXFUdHRRc3NCe3s+
-dXU8cnI4cHBFdHQ6bm42a2sxaGg0ZmYvZGQuYWE1Z2cyY2PUbW3x9/euoKCZqKil0NA8MXYPAAAEaklEQVR4Ae
-3a2VoaMRzH8SyMy3RPLwQVWSJCcStqQEGtVkGt1qXWFVv3+78DJhmTWc7yfyYzzpzvU3j5HMIwmYnKBnQ1vd/o9
-fRG002rbMBE48u7X+qP9Udv7y562rJsQEvLe78/0vT1Z90+MzuhsgFTe+V72/PZnnJlZQ209VeGVlbdVLdvtB/l
-oobayqrmHo7qpdyO3j9e+77q9ZCWU71TPshprKP/G5VyGPH0XlvVrjUO9VGO9fXOhVXvWrOvj3P8zbqXy1jTgpn
-esda3ZF7Tg29OC/X+g/BZfz5o9wutc9LQp9FY/yvx4xdD1oJXPYfnrDFb9jnpHlkj1K4dDpYDxhbK4sNvg0OQRb
-HRb4BX0YbW3B9P4HUU3QKHeNtFewPqDqwRYgN4HZsX+NQbGNM1gW27pjkaW4CXWQM+A16D0O2B12HNGuDFr4a7g
-LcfvQJTgGZQsyb4bBrKtQAva0wPiGrB65RKtYAJa9Y0dB0V3QcYs2ZNDaD6FYCxQM2aGlDdX9AYjKlW1KypASwC
-WMaYGuP6mLKmB5QBb1S/aNDaEQAXsaZnTQvYArxWEGdtC7SwYs0KuAS8izjO2iUo1qSsaQFNwBvEcdaaoLAixZo
-W0AO8QRxnrQeKNSlrWkAf8AZxnLU+KKxIsXYCkOc/dxLHWTsBxZoUa1rAmTHAWRxn7QwUa1Ks6QAOgDt4gTM71g
-FAikVNiTUd4BrADTzbjjUOKNasWFujBnwGngfPsmKNA4o1OdakgCsA19Ct9K1YcwHFmiRrUsBZB7oOdEFZwTUr1
-jqgWJNkTQroA+gDcGAFs2LNAcWaJGtSwOUlgEt4QRaZswIKK5KsnQJo9wHcw+uwYoxZATcr1qRZI/8HdO/h9eF54
-LVuUzJrFI8BeNYFLEMz1SkZQHkOhM65gLdNLdC6qpTFWu1K0+1nfuNlLtB5rpmrXZfMWu1aM53d31YmZnzdWcOsN
-WpnRNZqZ5pu7+7+/r6bWUy9xowtZhfIDNYYA0yq5IzRd6G+3mWw1qhbR2at3tB0zs/Pb87POvQqaxfIZNb0CzxQC
-WWy5jlgN0MBeqMu2BoOAIV/7lZK9qwBYDO+BrxhRMGRuQZwZnY/4J2rNzJnDcDVX9EbhuMUH5izBuB4ZYq1OlWYM
-WdtZbhuKwVrtUIKdqxZLxmLG8BqlZa9Bde6dADrXVLS98LrfXrqTVBa+tlIeyzIw54Pt0eCQ/S9weZI8BNGPwO5G
-AlWYFQQHgrWYVZwNBSswrReHgqaEWaFfSgogWhVnguqEXYVx6HgMsK04jwUXETYVgXnQfcLUaxU4C9ZrRuI4n4C/
-8/lQxRvB+5jYoQNPsG9fgZRTL2B9/CiRD9kXU8vINrPM/A+fkY0g/9eZRjQHXaBD9oF6IYdoIPGALrZB2hpJUCLt
-RGg9c8F6MV7BfRqXQK9fXOAvl9LgPbIGaA2OAK0ykWA9tktQEdfAjT9PxCwc1GGAQeijv8BeJtQA17UPu8AAAAA
-SUVORK5CYII=
-"""
 
 
 class MainWindow(QMainWindow):
@@ -415,9 +354,11 @@ class MainWindow(QMainWindow):
         self.router = None
         self.config = load_config()
         
-        # Set application icon
-        self.set_app_icon()
-        
+        # Create a timer for periodic UI updates
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.refresh_request_display)
+        self.update_timer.setInterval(1000)  # Update every second
+            
         # Set application style
         self.set_app_style()
         
@@ -433,17 +374,6 @@ class MainWindow(QMainWindow):
         # Load model mappings in settings
         self.load_mappings()
     
-    def set_app_icon(self):
-        """Set the application icon"""
-        try:
-            # Decode the base64 icon
-            icon_data = base64.b64decode(OLLAMA_ICON)
-            pixmap = QPixmap()
-            pixmap.loadFromData(icon_data)
-            icon = QIcon(pixmap)
-            self.setWindowIcon(icon)
-        except Exception as e:
-            logging.warning(f"Failed to set application icon: {str(e)}")
     
     def set_app_style(self):
         """Set global application style"""
@@ -591,14 +521,14 @@ class MainWindow(QMainWindow):
         status_label = QLabel("<b>Status:</b>")
         port_label = QLabel("<b>Port:</b>")
         local_url_label = QLabel("<b>Local URL:</b>")
-        cf_url_label = QLabel("<b>CloudFlare URL:</b>")
+        tunnel_url_label = QLabel("<b>Tunnel URL:</b>")
         
         # Set fixed width for labels to ensure alignment
         label_width = 120
         status_label.setFixedWidth(label_width)
         port_label.setFixedWidth(label_width)
         local_url_label.setFixedWidth(label_width)
-        cf_url_label.setFixedWidth(label_width)
+        tunnel_url_label.setFixedWidth(label_width)
         
         # Create value widgets
         self.status_field = QLabel("Not Running")
@@ -613,22 +543,22 @@ class MainWindow(QMainWindow):
         local_url_layout.addWidget(self.url_field, 1)  # Add stretch factor
         local_url_layout.addStretch(0)  # Remove extra stretch
         
-        # CloudFlare URL with copy button
-        cf_url_layout = QHBoxLayout()
-        cf_url_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins
+        # Tunnel URL with copy button
+        tunnel_url_layout = QHBoxLayout()
+        tunnel_url_layout.setContentsMargins(0, 0, 0, 0)  # Remove margins
         self.tunnel_url_field = QLabel("-")
         self.tunnel_url_field.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.tunnel_url_field.setStyleSheet("font-weight: bold;")
         
-        # Copy button for CloudFlare URL
-        self.copy_cf_button = QPushButton("Copy")
-        self.copy_cf_button.setStyleSheet("background-color: #2196F3; color: white; padding: 4px; border-radius: 4px;")
-        self.copy_cf_button.setFixedWidth(50)
-        self.copy_cf_button.clicked.connect(self.copy_cloudflare_url)
-        self.copy_cf_button.setEnabled(False)
+        # Copy button for Tunnel URL
+        self.copy_tunnel_button = QPushButton("Copy")
+        self.copy_tunnel_button.setStyleSheet("background-color: #2196F3; color: white; padding: 4px; border-radius: 4px;")
+        self.copy_tunnel_button.setFixedWidth(50)
+        self.copy_tunnel_button.clicked.connect(self.copy_tunnel_url)
+        self.copy_tunnel_button.setEnabled(False)
         
-        cf_url_layout.addWidget(self.tunnel_url_field, 1)  # Add stretch factor
-        cf_url_layout.addWidget(self.copy_cf_button, 0)  # No stretch
+        tunnel_url_layout.addWidget(self.tunnel_url_field, 1)  # Add stretch factor
+        tunnel_url_layout.addWidget(self.copy_tunnel_button, 0)  # No stretch
         
         # Add fields to grid layout - use 4 rows x 2 columns
         status_layout.addWidget(status_label, 0, 0, Qt.AlignmentFlag.AlignLeft)
@@ -640,8 +570,8 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(local_url_label, 2, 0, Qt.AlignmentFlag.AlignLeft)
         status_layout.addLayout(local_url_layout, 2, 1)
         
-        status_layout.addWidget(cf_url_label, 3, 0, Qt.AlignmentFlag.AlignLeft)
-        status_layout.addLayout(cf_url_layout, 3, 1)
+        status_layout.addWidget(tunnel_url_label, 3, 0, Qt.AlignmentFlag.AlignLeft)
+        status_layout.addLayout(tunnel_url_layout, 3, 1)
         
         # Stretch the second column
         status_layout.setColumnStretch(1, 1)
@@ -798,12 +728,21 @@ class MainWindow(QMainWindow):
         # Requests list with better styling
         self.request_table = QTableWidget(0, 4)
         self.request_table.setHorizontalHeaderLabels(["Timestamp", "Model", "Messages", "Status"])
-        self.request_table.horizontalHeader().setStretchLastSection(True)
         self.request_table.setAlternatingRowColors(True)
         self.request_table.setStyleSheet("alternate-background-color: #f2f2f2;")
         self.request_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.request_table.itemClicked.connect(self.on_request_selected)
         self.request_table.setMinimumHeight(200)  # Set minimum height for request table
+        
+        # Set column width distribution
+        header = self.request_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Timestamp
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)           # Model
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Messages
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Status
+        
+        # Make sure the table takes the full width of its container
+        self.request_table.horizontalHeader().setStretchLastSection(False) 
         
         requests_layout.addWidget(self.request_table)
         
@@ -896,8 +835,8 @@ class MainWindow(QMainWindow):
         self.port_input = QLineEdit(str(self.config["server"]["port"]))
         self.port_input.setStyleSheet("padding: 6px; border: 1px solid #ddd; border-radius: 4px;")
         
-        self.tunnel_checkbox = QCheckBox("Use Cloudflared Tunnel")
-        self.tunnel_checkbox.setChecked(self.config["cloudflared"]["use_tunnel"])
+        self.tunnel_checkbox = QCheckBox("Use localhost.run Tunnel")
+        self.tunnel_checkbox.setChecked(self.config["tunnel"]["use_tunnel"])
         
         # Ollama settings
         self.ollama_endpoint_input = QLineEdit(self.config["ollama"]["endpoint"])
@@ -924,21 +863,121 @@ class MainWindow(QMainWindow):
         self.api_key_toggle_button.clicked.connect(self.toggle_api_key_visibility)
         api_key_layout.addWidget(self.api_key_toggle_button)
         
+        # Add thinking mode toggle
+        thinking_label = QLabel("Thinking Mode:")
+        thinking_label.setFixedWidth(label_width)
+        self.thinking_checkbox = QCheckBox("Enable thinking mode")
+        # Set initial state from config
+        thinking_enabled = True  # Default value
+        if "ollama" in self.config and "thinking_mode" in self.config["ollama"]:
+            thinking_enabled = self.config["ollama"]["thinking_mode"]
+        self.thinking_checkbox.setChecked(thinking_enabled)
+        thinking_help = QLabel("When disabled, /no_think prefix will be automatically added to all prompts")
+        thinking_help.setStyleSheet("color: #666; font-style: italic;")
+        
+        # Add tooltip explaining the feature in more detail
+        tooltip_text = """
+        Thinking Mode controls how models process requests:
+        
+        ENABLED: Normal operation with full "thinking" process
+        DISABLED: Adds /no_think prefix to prompt the model to respond more directly
+        
+        Disabling thinking mode makes responses faster but potentially less thorough.
+        """
+        self.thinking_checkbox.setToolTip(tooltip_text)
+        thinking_label.setToolTip(tooltip_text)
+        
+        # Add integrity check toggle
+        integrity_label = QLabel("Integrity Checks:")
+        integrity_label.setFixedWidth(label_width)
+        self.skip_integrity_checkbox = QCheckBox("Skip model integrity checks")
+        # Set initial state from config
+        skip_integrity = False  # Default value
+        if "ollama" in self.config and "skip_integrity_check" in self.config["ollama"]:
+            skip_integrity = self.config["ollama"]["skip_integrity_check"]
+        self.skip_integrity_checkbox.setChecked(skip_integrity)
+        integrity_help = QLabel("Enable to skip model integrity checks if you experience timeouts")
+        integrity_help.setStyleSheet("color: #666; font-style: italic;")
+        
+        # Add tooltip explaining the feature in more detail
+        integrity_tooltip = """
+        Model integrity checks help detect corrupt model files early,
+        but can cause timeout errors with large models or slow systems.
+        
+        If you see 'Read timed out' errors in the logs, try enabling this option.
+        """
+        self.skip_integrity_checkbox.setToolTip(integrity_tooltip)
+        integrity_label.setToolTip(integrity_tooltip)
+        
+        # Add token limit control
+        token_label = QLabel("Max Tokens:")
+        token_label.setFixedWidth(label_width)
+        self.token_limit_spinner = QSpinBox()
+        self.token_limit_spinner.setMinimum(2000)
+        self.token_limit_spinner.setMaximum(32000)
+        self.token_limit_spinner.setSingleStep(1000)
+        # Default to 32000 if not in config
+        token_limit = 32000
+        if "ollama" in self.config and "max_streaming_tokens" in self.config["ollama"]:
+            token_limit = self.config["ollama"]["max_streaming_tokens"]
+        self.token_limit_spinner.setValue(token_limit)
+        token_help = QLabel("Higher values keep more context but may use more memory")
+        token_help.setStyleSheet("color: #666; font-style: italic;")
+        
         # Add to layout
-        settings_layout.addWidget(host_label, 0, 0, Qt.AlignmentFlag.AlignLeft)
-        settings_layout.addWidget(self.host_input, 0, 1)
+        row = 0
         
-        settings_layout.addWidget(port_label, 1, 0, Qt.AlignmentFlag.AlignLeft)
-        settings_layout.addWidget(self.port_input, 1, 1)
+        settings_layout.addWidget(host_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.host_input, row, 1)
+        row += 1
         
-        settings_layout.addWidget(tunnel_label, 2, 0, Qt.AlignmentFlag.AlignLeft)
-        settings_layout.addWidget(self.tunnel_checkbox, 2, 1)
+        settings_layout.addWidget(port_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.port_input, row, 1)
+        row += 1
         
-        settings_layout.addWidget(ollama_label, 3, 0, Qt.AlignmentFlag.AlignLeft)
-        settings_layout.addWidget(self.ollama_endpoint_input, 3, 1)
+        settings_layout.addWidget(tunnel_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.tunnel_checkbox, row, 1)
+        row += 1
         
-        settings_layout.addWidget(openai_key_label, 4, 0, Qt.AlignmentFlag.AlignLeft)
-        settings_layout.addLayout(api_key_layout, 4, 1)
+        settings_layout.addWidget(ollama_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.ollama_endpoint_input, row, 1)
+        row += 1
+        
+        settings_layout.addWidget(openai_key_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addLayout(api_key_layout, row, 1)
+        row += 1
+        
+        # Add separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        separator.setStyleSheet("background-color: #ddd;")
+        settings_layout.addWidget(separator, row, 0, 1, 2)
+        row += 1
+        
+        # Add thinking mode
+        settings_layout.addWidget(thinking_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.thinking_checkbox, row, 1)
+        row += 1
+        settings_layout.addWidget(QLabel(), row, 0)  # Empty spacer
+        settings_layout.addWidget(thinking_help, row, 1)
+        row += 1
+        
+        # Add integrity check
+        settings_layout.addWidget(integrity_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.skip_integrity_checkbox, row, 1)
+        row += 1
+        settings_layout.addWidget(QLabel(), row, 0)  # Empty spacer
+        settings_layout.addWidget(integrity_help, row, 1)
+        row += 1
+        
+        # Add token limit
+        settings_layout.addWidget(token_label, row, 0, Qt.AlignmentFlag.AlignLeft)
+        settings_layout.addWidget(self.token_limit_spinner, row, 1)
+        row += 1
+        settings_layout.addWidget(QLabel(), row, 0)  # Empty spacer
+        settings_layout.addWidget(token_help, row, 1)
+        row += 1
         
         # Save button
         save_button = QPushButton("Save Settings")
@@ -947,9 +986,10 @@ class MainWindow(QMainWindow):
         save_button.setMinimumWidth(120)
         
         # Add spacer and button at bottom
-        settings_layout.addWidget(QWidget(), 5, 0, 1, 2)  # Empty spacer
-        settings_layout.addWidget(save_button, 6, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
-        settings_layout.setRowStretch(5, 1)  # Make the spacer expand
+        settings_layout.addWidget(QWidget(), row, 0, 1, 2)  # Empty spacer
+        settings_layout.setRowStretch(row, 1)  # Make the spacer expand
+        row += 1
+        settings_layout.addWidget(save_button, row, 0, 1, 2, Qt.AlignmentFlag.AlignCenter)
         
         # Right side - Model Mappings
         mappings_group = QGroupBox("Model Mappings")
@@ -1144,11 +1184,23 @@ class MainWindow(QMainWindow):
         
         self.config["ollama"]["model_mappings"] = mappings
         
+        # Save thinking mode setting
+        self.config["ollama"]["thinking_mode"] = self.thinking_checkbox.isChecked()
+        
+        # Save integrity check setting
+        self.config["ollama"]["skip_integrity_check"] = self.skip_integrity_checkbox.isChecked()
+        
+        # Save token limit setting
+        self.config["ollama"]["max_streaming_tokens"] = self.token_limit_spinner.value()
+        
         # Save to file
         try:
             with open("config.json", "w") as f:
                 json.dump(self.config, f, indent=4)
             logging.info(f"Model mappings saved to config.json: {json.dumps(mappings)}")
+            logging.info(f"Thinking mode saved: {self.thinking_checkbox.isChecked()}")
+            logging.info(f"Skip integrity checks: {self.skip_integrity_checkbox.isChecked()}")
+            logging.info(f"Max streaming tokens: {self.token_limit_spinner.value()}")
             
             # Reinitialize router with new settings
             self.init_router()
@@ -1160,7 +1212,7 @@ class MainWindow(QMainWindow):
         """Save settings to config.json"""
         self.config["server"]["hostname"] = self.host_input.text()
         self.config["server"]["port"] = int(self.port_input.text())
-        self.config["cloudflared"]["use_tunnel"] = self.tunnel_checkbox.isChecked()
+        self.config["tunnel"]["use_tunnel"] = self.tunnel_checkbox.isChecked()
         self.config["ollama"]["endpoint"] = self.ollama_endpoint_input.text()
         
         # Save OpenAI API key
@@ -1205,6 +1257,11 @@ class MainWindow(QMainWindow):
             self.available_models_text.append(f"Error connecting to Ollama: {self.router.connection_error}")
         else:
             self.available_models_text.append(f"<b>Default model:</b> {self.router.default_model}\n")
+            
+            # Display thinking mode status
+            thinking_status = "Enabled" if self.router.thinking_mode else "Disabled (using /no_think)"
+            self.available_models_text.append(f"<b>Thinking mode:</b> {thinking_status}\n")
+            
             self.available_models_text.append("<b>Available models:</b>")
             for model in self.router.available_models:
                 self.available_models_text.append(f"• {model}")
@@ -1255,8 +1312,8 @@ class MainWindow(QMainWindow):
             # Resize rows to contents
             self.model_table.resizeRowsToContents()
     
-    def copy_cloudflare_url(self):
-        """Copy CloudFlare URL to clipboard"""
+    def copy_tunnel_url(self):
+        """Copy Tunnel URL to clipboard"""
         url = self.tunnel_url_field.text()
         if url and url != "-" and url != "Disabled" and url != "Starting...":
             clipboard = QApplication.clipboard()
@@ -1264,30 +1321,75 @@ class MainWindow(QMainWindow):
             logging.info(f"Copied to clipboard: {url}")
             
             # Show visual feedback
-            original_text = self.copy_cf_button.text()
-            original_style = self.copy_cf_button.styleSheet()
+            original_text = self.copy_tunnel_button.text()
+            original_style = self.copy_tunnel_button.styleSheet()
             
-            self.copy_cf_button.setText("✓")
-            self.copy_cf_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 4px;")
+            self.copy_tunnel_button.setText("✓")
+            self.copy_tunnel_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 4px;")
             
             # Reset after a short delay
             def reset_button():
-                self.copy_cf_button.setText(original_text)
-                self.copy_cf_button.setStyleSheet(original_style)
+                self.copy_tunnel_button.setText(original_text)
+                self.copy_tunnel_button.setStyleSheet(original_style)
             
             QTimer.singleShot(1500, reset_button)
 
     def update_tunnel_url(self, url):
-        """Update the CloudFlare tunnel URL"""
-        if url:
-            api_url = f"{url}/v1"
-            self.tunnel_url_field.setText(api_url)
-            self.copy_cf_button.setEnabled(True)
-            logging.info(f"CloudFlare tunnel URL: {api_url}")
+        """Update the tunnel URL"""
+        if not url:
+            self.tunnel_url_field.setText("No tunnel URL available")
+            self.copy_tunnel_button.setEnabled(False)
+            logging.error("Received empty tunnel URL")
+            return
             
-            # Update the status bar too
-            local_url = self.url_field.text()
-            self.status_label.setText(f"Running locally on {local_url} and via tunnel at {api_url}")
+        # Check for admin.localhost.run which should be rejected
+        if url.startswith("https://admin.localhost.run"):
+            self.tunnel_url_field.setText("❌ ERROR: admin.localhost.run received (won't work!)")
+            self.copy_tunnel_button.setEnabled(False)
+            self.tunnel_url_field.setStyleSheet("color: red; font-weight: bold;")
+            logging.error(f"CRITICAL ERROR: Received admin URL '{url}'. This URL will NOT work with Cursor AI.")
+            logging.error("You must restart with a proper tunnel that doesn't use the admin URL.")
+            return
+            
+        # Valid tunnel URL - format as API URL
+        api_url = f"{url}/v1"
+        self.tunnel_url_field.setText(api_url)
+        self.copy_tunnel_button.setEnabled(True)
+        self.tunnel_url_field.setStyleSheet("color: green; font-weight: bold;")
+        
+        # Log with domain information for clarity
+        if ".lhr.life" in url:
+            logging.info(f"Tunnel URL set (lhr.life domain): {api_url}")
+        else:
+            logging.info(f"Tunnel URL set: {api_url}")
+        
+        # Update the status bar too
+        local_url = self.url_field.text()
+        self.status_label.setText(f"Running locally on {local_url} and via tunnel at {api_url}")
+    
+    def is_port_in_use(self, port):
+        """Check if a port is already in use"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('localhost', port))
+                return False
+            except OSError:
+                return True
+    
+    def find_available_port(self, start_port, max_attempts=10):
+        """Find an available port starting from start_port"""
+        current_port = start_port
+        attempts = 0
+        
+        while attempts < max_attempts:
+            if not self.is_port_in_use(current_port):
+                return current_port
+            current_port += 1
+            attempts += 1
+        
+        # If we couldn't find an available port, return the original port
+        # and let the server handle the error
+        return start_port
     
     def start_server(self):
         """Start the FastAPI server"""
@@ -1297,53 +1399,105 @@ class MainWindow(QMainWindow):
         # Disable start button immediately to prevent double clicks
         self.start_button.setEnabled(False)
         
-        host = self.host_input.text()
-        port = int(self.port_input.text())
-        ollama_endpoint = self.ollama_endpoint_input.text()
-        use_tunnel = self.tunnel_checkbox.isChecked()
-        
-        # Get API key if available
-        api_key = None
-        if "openai" in self.config and "api_key" in self.config["openai"]:
-            api_key = self.config["openai"]["api_key"]
-        
-        self.server_thread = ServerThread(
-            port=port,
-            host=host,
-            ollama_endpoint=ollama_endpoint,
-            use_tunnel=use_tunnel,
-            router=self.router,
-            api_key=api_key
-        )
-        
-        # Connect signals
-        self.server_thread.update_signal.connect(self.update_request_log)
-        self.server_thread.tunnel_url_signal.connect(self.update_tunnel_url)
-        
-        # Start the server
-        self.server_thread.start()
-        
-        # Update UI
-        self.stop_button.setEnabled(True)
-        self.status_field.setText("Running")
-        self.status_field.setStyleSheet("font-weight: bold; color: #4CAF50;")
-        self.port_field.setText(str(port))
-        base_url = f"http://{host}:{port}/v1"
-        self.url_field.setText(base_url)
-        self.status_label.setText(f"Running on {base_url}")
-        
-        # Reset CloudFlare URL if not using tunnel
-        if not use_tunnel:
-            self.tunnel_url_field.setText("Disabled")
-            self.copy_cf_button.setEnabled(False)
-        else:
-            self.tunnel_url_field.setText("Starting...")
-            self.copy_cf_button.setEnabled(False)
-        
-        # Update the model mapping display to show current mappings
-        self.update_model_display()
-        
-        logging.info(f"Server started on {base_url}")
+        # Get server configuration
+        try:
+            host = self.host_input.text().strip()
+            if not host:
+                host = "127.0.0.1"  
+                self.host_input.setText(host)
+            
+            try:
+                port = int(self.port_input.text())
+                if port <= 0 or port > 65535:
+                    raise ValueError("Port must be between 1 and 65535")
+            except ValueError as e:
+                logging.error(f"Invalid port number: {str(e)}")
+                port = 8000 
+                self.port_input.setText(str(port))
+            if self.is_port_in_use(port):
+                original_port = port
+                port = self.find_available_port(port)
+                
+                if port != original_port:
+                    logging.warning(f"Port {original_port} is already in use. Using port {port} instead.")
+
+                    self.config["server"]["port"] = port
+                    self.port_input.setText(str(port))
+                else:
+                    logging.error(f"Port {original_port} is already in use and no alternative ports are available.")
+
+                    self.start_button.setEnabled(True)
+                    return
+            
+            ollama_endpoint = self.ollama_endpoint_input.text().strip()
+            if not ollama_endpoint:
+                ollama_endpoint = "http://localhost:11434" 
+                self.ollama_endpoint_input.setText(ollama_endpoint)
+                
+            use_tunnel = self.tunnel_checkbox.isChecked()
+            api_key = None
+            if "openai" in self.config and "api_key" in self.config["openai"]:
+                api_key = self.config["openai"]["api_key"]
+            
+            if self.server_thread:
+                try:
+                    if self.server_thread.isRunning():
+                        self.server_thread.running = False
+                        self.server_thread.terminate()
+                    self.server_thread = None
+                except Exception as e:
+                    logging.error(f"Error cleaning up old server thread: {str(e)}")
+                    self.server_thread = None  
+
+            self.server_thread = ServerThread(
+                port=port,
+                host=host,
+                ollama_endpoint=ollama_endpoint,
+                use_tunnel=use_tunnel,
+                router=self.router,
+                api_key=api_key
+            )
+            
+            self.server_thread.update_signal.connect(self.update_request_log)
+            self.server_thread.tunnel_url_signal.connect(self.update_tunnel_url)
+            self.server_thread.request_update_signal.connect(self.refresh_request_display)
+            
+            # Start the server
+            self.server_thread.start()
+            
+            # Start the update timer
+            self.update_timer.start()
+            
+            # Update UI
+            self.stop_button.setEnabled(True)
+            self.status_field.setText("Running")
+            self.status_field.setStyleSheet("font-weight: bold; color: #4CAF50;")
+            self.port_field.setText(str(port))
+            base_url = f"http://{host}:{port}/v1"
+            self.url_field.setText(base_url)
+            self.status_label.setText(f"Running on {base_url}")
+            
+            # Reset Tunnel URL if not using tunnel
+            if not use_tunnel:
+                self.tunnel_url_field.setText("Disabled")
+                self.copy_tunnel_button.setEnabled(False)
+            else:
+                self.tunnel_url_field.setText("Starting...")
+                self.copy_tunnel_button.setEnabled(False)
+
+            self.update_model_display()
+            
+            logging.info(f"Server started on {base_url}")
+            
+        except Exception as e:
+            logging.error(f"Error starting server: {str(e)}")
+            self.start_button.setEnabled(True)
+            if self.server_thread:
+                try:
+                    self.server_thread.terminate()
+                except:
+                    pass
+                self.server_thread = None
     
     def stop_server(self):
         """Stop the server"""
@@ -1351,15 +1505,27 @@ class MainWindow(QMainWindow):
             logging.info("Stopping server...")
             self.status_field.setText("Stopping...")
             self.status_field.setStyleSheet("font-weight: bold; color: #FFA000;")
-            
-            # Disable both buttons while stopping
+            self.update_timer.stop()
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            
-            # Signal the thread to stop
             self.server_thread.running = False
             
-            # Force terminate the thread if it doesn't stop within a timeout
+
+            try:
+                if hasattr(self.server_thread, 'server') and self.server_thread.server:
+                    def force_shutdown():
+                        try:
+                            if hasattr(self.server_thread.server, "should_exit"):
+                                self.server_thread.server.should_exit = True
+                            if hasattr(self.server_thread.server, "force_exit"):
+                                self.server_thread.server.force_exit = True
+                        except Exception as e:
+                            logging.error(f"Error in force_shutdown: {str(e)}")
+                    
+                    threading.Thread(target=force_shutdown, daemon=True).start()
+            except Exception as e:
+                logging.error(f"Error forcing server shutdown: {str(e)}")
+            
             max_wait_time = 5000  # 5 seconds
             check_interval = 100  # 100ms
             checks_performed = 0
@@ -1369,28 +1535,62 @@ class MainWindow(QMainWindow):
                 nonlocal checks_performed
                 checks_performed += 1
                 
+                # Check if the thread was terminated already
+                if self.server_thread is None:
+                    self.update_ui_after_stop()
+                    return
+                
                 if not self.server_thread.isRunning():
-                    # Thread stopped normally, update UI
+                    # Create a temporary reference to avoid access after deletion
+                    temp_thread = self.server_thread
                     self.server_thread = None
+                    try:
+                        # Clean up thread resources (if any)
+                        del temp_thread
+                    except:
+                        pass
+                    
                     self.update_ui_after_stop()
                     return
                 
                 if checks_performed >= max_checks:
-                    # Thread didn't stop within timeout, force termination
                     logging.warning("Server thread didn't stop within timeout, forcing termination")
-                    self.server_thread.terminate()
-                    self.server_thread = None
+                    try:
+                        # Terminate the thread safely
+                        temp_thread = self.server_thread
+                        self.server_thread = None
+                        temp_thread.terminate()
+                        
+                        # Try to clean up resources
+                        del temp_thread
+                    except Exception as e:
+                        logging.error(f"Error terminating thread: {str(e)}")
+                    
                     self.update_ui_after_stop()
+                    
+                    # Kill any processes that might be blocking the port
+                    try:
+                        port = self.config["server"]["port"]
+                        platform_system = platform.system()
+                        
+                        if platform_system == "Windows":
+                            subprocess.run(f"FOR /F \"tokens=5\" %a in ('netstat -ano ^| findstr :{port}') do taskkill /F /PID %a", shell=True)
+                        elif platform_system == "Darwin":  # macOS
+                            subprocess.run(f"lsof -i :{port} | grep LISTEN | awk '{{print $2}}' | xargs -r kill -9 2>/dev/null || true", shell=True)
+                        else:  # Linux and others
+                            subprocess.run(f"lsof -i :{port} | grep LISTEN | awk '{{print $2}}' | xargs -r kill -9", shell=True)
+                        
+                        logging.info(f"Forcibly released port {port}")
+                    except Exception as e:
+                        logging.error(f"Error cleaning up port: {str(e)}")
+                    
                     return
                 
-                # Check again after interval
                 QTimer.singleShot(check_interval, check_thread_stopped)
             
-            # Start checking if the thread has stopped
             QTimer.singleShot(check_interval, check_thread_stopped)
             
         else:
-            # No server is running, just update UI
             self.update_ui_after_stop()
 
     def update_ui_after_stop(self):
@@ -1401,56 +1601,84 @@ class MainWindow(QMainWindow):
         self.status_field.setStyleSheet("font-weight: bold; color: #f44336;")
         self.status_label.setText("Not Running")
         self.tunnel_url_field.setText("-")
-        self.copy_cf_button.setEnabled(False)
+        self.copy_tunnel_button.setEnabled(False)
+        
+        self.update_timer.stop()
+        
         logging.info("Server stopped")
     
     def update_request_log(self, message):
         """Update the request log with a new message"""
         logging.info(message)
-        
-        # Update the request table if we have a server thread
+    
+    def refresh_request_display(self):
+        """Refresh the request table display with current data"""
         if self.server_thread and hasattr(self.server_thread, "request_log"):
-            # Clear the table
+            current_row = self.request_table.currentRow()
+            
             self.request_table.setRowCount(0)
             
-            # Add entries
             for i, entry in enumerate(self.server_thread.request_log):
                 self.request_table.insertRow(i)
                 
-                # Convert timestamp
                 dt = datetime.datetime.fromtimestamp(entry.timestamp)
                 time_str = dt.strftime("%H:%M:%S")
                 
-                # Add data
                 self.request_table.setItem(i, 0, QTableWidgetItem(time_str))
                 self.request_table.setItem(i, 1, QTableWidgetItem(entry.model))
                 
-                # Count messages
                 msg_count = len(entry.messages)
                 self.request_table.setItem(i, 2, QTableWidgetItem(f"{msg_count} messages"))
                 
-                # Status with color and streaming indication
                 status_text = entry.status
-                if entry.is_streaming and entry.status == "Pending" and hasattr(entry, 'completed_chunks') and entry.completed_chunks > 0:
+                
+                current_time = time.time()
+                is_stale = False
+                
+                if hasattr(entry, 'last_update_time') and entry.last_update_time:
+                    time_since_update = current_time - entry.last_update_time
+                    if time_since_update > 30 and entry.status == "Pending":
+                        is_stale = True
+                elif hasattr(entry, 'start_time'):
+                    time_since_start = current_time - entry.start_time
+                    if time_since_start > 60 and entry.status == "Pending":
+                        is_stale = True
+                
+                if is_stale:
+                    entry.mark_completed()
+                    status_text = "Completed"
+                
+                if entry.is_streaming and entry.status == "Pending" and entry.completed_chunks > 0:
                     status_text = f"Streaming ({entry.completed_chunks})"
+                elif entry.is_streaming and entry.status == "Completed" and entry.completed_chunks > 0:
+                    status_text = f"Completed ({entry.completed_chunks})"
                 
                 status_item = QTableWidgetItem(status_text)
                 
-                # Set color based on status
                 if entry.status == "Completed":
-                    status_item.setForeground(QColor("#4CAF50"))  # Green
+                    status_item.setForeground(QColor("#4CAF50"))  
                 elif entry.status == "Timeout":
-                    status_item.setForeground(QColor("#FF9800"))  # Orange
+                    status_item.setForeground(QColor("#FF9800"))  
                 elif entry.status == "Error":
-                    status_item.setForeground(QColor("#F44336"))  # Red
+                    status_item.setForeground(QColor("#F44336")) 
                 elif status_text.startswith("Streaming"):
-                    status_item.setForeground(QColor("#2196F3"))  # Blue for active streaming
+                    status_item.setForeground(QColor("#2196F3"))  
                 
                 self.request_table.setItem(i, 3, status_item)
-                
-            # Resize columns
-            self.request_table.resizeColumnsToContents()
-    
+            
+            header = self.request_table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) 
+            
+            if (current_row < 0 or current_row >= self.request_table.rowCount()) and self.request_table.rowCount() > 0:
+                select_row = min(max(0, current_row), self.request_table.rowCount() - 1)
+                self.request_table.selectRow(select_row)
+                self.on_request_selected(self.request_table.item(select_row, 0))
+            elif current_row >= 0 and current_row < self.request_table.rowCount():
+                self.request_table.selectRow(current_row)
+
     def on_request_selected(self, item):
         """Handle request selection from the request table"""
         row = item.row()
@@ -1459,33 +1687,50 @@ class MainWindow(QMainWindow):
             if row < len(self.server_thread.request_log):
                 entry = self.server_thread.request_log[row]
                 
-                # Show request with formatting
-                formatted_request = json.dumps(entry.request_data, indent=2)
-                self.request_text.setText(formatted_request)
+                try:
+                    formatted_request = json.dumps(entry.request_data, indent=2)
+                    self.request_text.setText(formatted_request)
+                except Exception as e:
+                    self.request_text.setText(f"Error formatting request: {str(e)}")
                 
-                # Show response if available
                 if entry.response_data:
-                    formatted_response = json.dumps(entry.response_data, indent=2)
-                    
-                    # Add color for error responses
-                    if entry.status == "Error" and "error" in entry.response_data:
-                        error_msg = entry.response_data["error"].get("message", "Unknown error")
-                        self.response_text.setHtml(f'<span style="color: #F44336; font-weight: bold;">ERROR: {error_msg}</span><br><br>' + 
-                                                 f'<pre>{formatted_response}</pre>')
-                    else:
-                        self.response_text.setText(formatted_response)
+                    try:
+                        formatted_response = json.dumps(entry.response_data, indent=2)
+                        
+                        if entry.status == "Error" and "error" in entry.response_data:
+                            error_msg = entry.response_data["error"].get("message", "Unknown error")
+                            self.response_text.setHtml(f'<span style="color: #F44336; font-weight: bold;">ERROR: {error_msg}</span><br><br>' + 
+                                                    f'<pre>{formatted_response}</pre>')
+                        else:
+                            self.response_text.setText(formatted_response)
+                    except Exception as e:
+                        self.response_text.setText(f"Error formatting response: {str(e)}")
                 else:
                     if entry.status == "Timeout":
                         self.response_text.setHtml('<span style="color: #FF9800; font-weight: bold;">Request timed out</span>')
                     elif entry.status == "Error":
-                        self.response_text.setHtml('<span style="color: #F44336; font-weight: bold;">Error occurred</span>')
+                        if hasattr(entry, 'last_error') and entry.last_error:
+                            self.response_text.setHtml(f'<span style="color: #F44336; font-weight: bold;">Error: {entry.last_error}</span>')
+                        else:
+                            self.response_text.setHtml('<span style="color: #F44336; font-weight: bold;">Error occurred</span>')
                     elif entry.is_streaming:
+                        elapsed = ""
+                        if hasattr(entry, 'start_time'):
+                            if hasattr(entry, 'last_update_time') and entry.last_update_time:
+                                elapsed = f" in {entry.last_update_time - entry.start_time:.1f}s"
+                            elif entry.status == "Completed":
+                                elapsed = f" in {time.time() - entry.start_time:.1f}s"
+                        
                         if entry.status == "Completed":
-                            self.response_text.setHtml('<span style="color: #4CAF50; font-weight: bold;">Streaming request completed</span><br>' +
-                                                   f'<span>Received {entry.completed_chunks} chunks</span>')
+                            self.response_text.setHtml(
+                                '<span style="color: #4CAF50; font-weight: bold;">Streaming request completed</span><br>' +
+                                f'<span>Received {entry.completed_chunks} chunks{elapsed}</span>'
+                            )
                         elif entry.completed_chunks > 0:
-                            self.response_text.setHtml('<span style="color: #2196F3; font-weight: bold;">Streaming in progress</span><br>' +
-                                                   f'<span>Received {entry.completed_chunks} chunks so far</span>')
+                            self.response_text.setHtml(
+                                '<span style="color: #2196F3; font-weight: bold;">Streaming in progress</span><br>' +
+                                f'<span>Received {entry.completed_chunks} chunks so far...</span>'
+                            )
                         else:
                             self.response_text.setText("Streaming request - waiting for data")
                     else:
@@ -1503,12 +1748,10 @@ class MainWindow(QMainWindow):
     def toggle_api_key_visibility(self):
         """Toggle the visibility of the OpenAI API key input"""
         if self.openai_api_key_input.echoMode() == QLineEdit.EchoMode.Password:
-            # Change to visible mode
             self.openai_api_key_input.setEchoMode(QLineEdit.EchoMode.Normal)
             self.api_key_toggle_button.setText("🔓")
             self.api_key_toggle_button.setToolTip("Hide API Key")
         else:
-            # Change to password mode
             self.openai_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
             self.api_key_toggle_button.setText("🔒")
             self.api_key_toggle_button.setToolTip("Show API Key")

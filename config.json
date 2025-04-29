@@ -5,17 +5,22 @@
     "ollama": {
         "endpoint": "http://localhost:11434",
         "model_mappings": {
-            "default": "Qwen2.5",
+            "default": "Qwen2.5-Coder:latest",
+            "qwen3": "Qwen3",
             "qwen2.5": "Qwen2.5",
             "qwen2.5-coder": "Qwen2.5-coder",
             "qwen2.5-r1": "cyberuser42/DeepSeek-R1-Distill-Qwen-7B"
-        }
+        },
+        "thinking_mode": true,
+        "skip_integrity_check": true,
+        "max_streaming_tokens": 32000
     },
     "server": {
         "port": 8080,
         "hostname": "127.0.0.1"
     },
-    "cloudflared": {
-        "use_tunnel": true
+    "tunnels": {
+        "use_tunnel": true,
+        "preferred": "localhost.run"
     }
 }

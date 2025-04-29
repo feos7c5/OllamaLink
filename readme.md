@@ -9,11 +9,12 @@ OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models
 - **Simple**: Minimal setup, just run and go
 - **Private**: Your code stays on your machine
 - **Flexible**: Use any Ollama model with Cursor
-- **Tunnel**: Works with Cursor's cloud service via CloudFlare tunnel
+- **Tunnel**: Works with Cursor's cloud service via localhost.run tunnels
 - **GUI & CLI**: Choose between graphical or command-line interface
 - **Model Mapping**: Map commercial model names to your local Ollama models
 - **Real-time Monitoring**: Track requests and responses in the GUI
 - **Secure**: Optional API key support for added security
+- **No Timeout Limits**: Long-running operations now supported without constraints
 
 ## Quick Start
 
@@ -53,11 +54,11 @@ First, download and install Cursor from the official website: [https://cursor.sh
 When you start OllamaLink, you'll get two types of URLs:
 
 1. **Local URL**: `http://localhost:8080/v1` (default)
-2. **CloudFlare Tunnel URL**: A public URL like `https://your-tunnel.trycloudflare.com/v1`
+2. **Tunnel URL**: A public URL like `https://randomsubdomain.localhost.run/v1`
 
 Choose the appropriate URL based on your needs:
 - Use the **Local URL** if running Cursor on the same machine and port forwarding at router
-- Use the **CloudFlare Tunnel URL** if you want to access your models from anywhere (reccomended)
+- Use the **Tunnel URL** if you want to access your models from anywhere (recommended)
 
 ### 3. Configure Cursor Settings
 
@@ -104,9 +105,10 @@ Choose the appropriate URL based on your needs:
    - Try restarting both OllamaLink and Cursor
 
 4. **Tunnel Issues**:
-   - Ensure CloudFlare tunnel is enabled in settings
-   - Check if CloudFlare daemon is installed
-   - Try using the local URL instead
+   - Ensure SSH is installed on your system for localhost.run tunnels
+   - Check the console logs for any tunnel connection errors
+   - If you see "permission denied" errors, make sure your SSH setup is correct
+   - The system will check for existing tunnels to avoid conflicts
 
 ## Configuration
 
@@ -125,14 +127,18 @@ You can customize OllamaLink using a `config.json` file in the project root:
             "gpt-3.5-turbo": "llama3", 
             "claude-3-opus": "wizardcoder",
             "default": "qwen2.5-coder"
-        }
+        },
+        "thinking_mode": true,
+        "skip_integrity_check": true,
+        "max_streaming_tokens": 32000
     },
     "server": {
         "port": 8080,
         "hostname": "127.0.0.1"
     },
-    "cloudflared": {
-        "use_tunnel": true
+    "tunnels": {
+        "use_tunnel": true,
+        "preferred": "localhost.run"
     }
 }
 ```
@@ -157,8 +163,8 @@ python run_cli.py [options]
 - `--direct`: Direct mode without tunnel
 - `--ollama URL`: Ollama API URL (default from config.json or http://localhost:11434)
 - `--host HOST`: Host to bind to (default from config.json or 127.0.0.1)
-- `--tunnel`: Use cloudflared tunnel (default: on)
-- `--no-tunnel`: Disable cloudflared tunnel
+- `--tunnel`: Use localhost.run tunnel (default: on)
+- `--no-tunnel`: Disable tunnel
 
 ## Model Mapping
 
@@ -255,6 +261,26 @@ Try these steps:
 
 3. **Update Cursor Model Selection**:
    In Cursor, make sure you're using mapped model names
+
+## Recent Changes
+
+### Tunneling Improvements
+- Switched to localhost.run for more reliable connections
+- Enhanced tunnel URL detection for various connection scenarios
+- Added checks for existing tunnel processes to prevent conflicts
+- Improved error handling and logging for tunnel connections
+
+### Thinking Mode
+- Added configurable thinking mode to control how models generate responses
+- When enabled (default), models perform thorough analysis before responding
+- Can be disabled with the `thinking_mode: false` setting for faster, more direct responses
+- Automatically adds the `/no_think` prefix to user messages when disabled
+
+### Timeout Constraints Removed
+- Removed all artificial timeout limitations
+- Support for long-running operations without time constraints
+- Fixed handling of structured message content for compatibility with Ollama's API
+- Improved model listing and availability detection
 
 ## License
 
