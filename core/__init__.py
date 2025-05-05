@@ -2,7 +2,7 @@
 OllamaLink Core Module - Bridge between OpenAI API and Ollama
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 from .api import create_api
 from .request import OllamaRequestHandler

@@ -19,8 +19,6 @@ import core.api as api
 
 import uvicorn
 import asyncio
-import httpx
-import re
 import threading
 import platform
 
@@ -250,6 +248,10 @@ class ServerThread(QThread):
             self.running = True
             
             if self.use_tunnel:
+                # Create and store a main event loop for better cleanup
+                self.loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self.loop)
+                
                 async def start_gui_tunnel():
                     try:
                         self.update_signal.emit("Starting localhost.run tunnel...")
@@ -309,6 +311,10 @@ class ServerThread(QThread):
                                 watchdog_time = current_time
                                 
                             await asyncio.sleep(5)
+                            
+                            # Exit the loop if we're no longer running
+                            if not self.running:
+                                break
                         
                         if process and process.poll() is None:
                             self.update_signal.emit("Stopping localhost.run tunnel...")
@@ -326,23 +332,103 @@ class ServerThread(QThread):
                         self.update_signal.emit(f"Error with tunnel: {str(e)}")
                 
                 try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.create_task(start_gui_tunnel())
-                    loop.run_until_complete(self.server.serve())
+                    tunnel_task = self.loop.create_task(start_gui_tunnel())
+                    
+                    # Use run_until_complete with proper error handling
+                    try:
+                        self.loop.run_until_complete(self.server.serve())
+                    except asyncio.CancelledError:
+                        self.update_signal.emit("Server task was cancelled")
+                    except Exception as e:
+                        self.update_signal.emit(f"Server error: {str(e)}")
+                    
+                    # Ensure clean event loop shutdown
+                    pending = asyncio.all_tasks(self.loop)
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                    
+                    if not self.loop.is_closed():
+                        # Run the event loop until all tasks are complete or cancelled
+                        if pending:
+                            try:
+                                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                            except Exception:
+                                pass
+                    
+                    # Clean closure of the event loop when done    
+                    if not self.loop.is_closed():
+                        self.loop.close()
+                
                 except Exception as e:
                     self.update_signal.emit(f"Error in server/tunnel loop: {str(e)}")
+                    # Ensure loop is closed even on error
+                    if hasattr(self, 'loop') and not self.loop.is_closed():
+                        try:
+                            self.loop.close()
+                        except Exception as loop_err:
+                            self.update_signal.emit(f"Error closing event loop: {str(loop_err)}")
             else:
                 try:
-                    asyncio.run(self.server.serve())
+                    # Create an event loop for direct server management
+                    self.loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(self.loop)
+                    
+                    try:
+                        self.loop.run_until_complete(self.server.serve())
+                    except asyncio.CancelledError:
+                        self.update_signal.emit("Server task was cancelled")
+                    except Exception as e:
+                        self.update_signal.emit(f"Server error: {str(e)}")
+                    
+                    # Ensure clean event loop shutdown
+                    pending = asyncio.all_tasks(self.loop)
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                    
+                    if not self.loop.is_closed():
+                        # Run the event loop until all tasks are complete or cancelled
+                        if pending:
+                            try:
+                                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                            except Exception:
+                                pass
+                    
+                    # Clean closure of the event loop when done
+                    if not self.loop.is_closed():
+                        self.loop.close()
+                    
                 except Exception as e:
                     self.update_signal.emit(f"Error running server: {str(e)}")
+                    # Ensure loop is closed even on error
+                    if hasattr(self, 'loop') and not self.loop.is_closed():
+                        try:
+                            self.loop.close()
+                        except Exception as loop_err:
+                            self.update_signal.emit(f"Error closing event loop: {str(loop_err)}")
         except Exception as e:
             self.update_signal.emit(f"Server startup error: {str(e)}")
     
     def stop(self):
         """Safely stop the server thread"""
         self.running = False
+        
+        # Ensure server has should_exit flag set
+        if hasattr(self, 'server') and self.server:
+            if hasattr(self.server, "should_exit"):
+                self.server.should_exit = True
+            if hasattr(self.server, "force_exit"):
+                self.server.force_exit = True
+                
+        # Cancel any pending tasks in the event loop
+        if hasattr(self, 'loop') and self.loop and not self.loop.is_closed():
+            try:
+                # Cancel all tasks
+                for task in asyncio.all_tasks(self.loop):
+                    task.cancel()
+            except Exception as e:
+                logging.error(f"Error cancelling tasks: {str(e)}")
 
 
 class MainWindow(QMainWindow):
@@ -1519,6 +1605,21 @@ class MainWindow(QMainWindow):
                                 self.server_thread.server.should_exit = True
                             if hasattr(self.server_thread.server, "force_exit"):
                                 self.server_thread.server.force_exit = True
+                            # Explicitly handle event loop closure for Lifespan
+                            if hasattr(self.server_thread, 'app') and self.server_thread.app:
+                                # Need to properly cleanup lifespan tasks
+                                if hasattr(self.server_thread.server, "lifespan"):
+                                    lifespan = self.server_thread.server.lifespan
+                                    if hasattr(lifespan, "shutdown_event"):
+                                        lifespan.shutdown_event.set()
+                                    if hasattr(lifespan, "receive_queue"):
+                                        # Clear any pending queue items to avoid blocking
+                                        try:
+                                            if not lifespan.receive_queue.empty():
+                                                while not lifespan.receive_queue.empty():
+                                                    lifespan.receive_queue.get_nowait()
+                                        except Exception:
+                                            pass
                         except Exception as e:
                             logging.error(f"Error in force_shutdown: {str(e)}")
                     

@@ -1,7 +1,6 @@
 import logging
 import asyncio
 import httpx
-import re
 from typing import Dict, List, Any
 from .util import estimate_message_tokens, count_tokens_in_messages
 
