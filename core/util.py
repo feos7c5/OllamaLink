@@ -164,6 +164,7 @@ async def start_localhost_run_tunnel(port: int, callback=None) -> Optional[Tuple
         process = await asyncio.create_subprocess_exec(
             "ssh", 
             "-o", "ServerAliveInterval=60", 
+            "-o", "ServerAliveCountMax=60",
             "-o", "StrictHostKeyChecking=no", 
             "-o", "UserKnownHostsFile=/dev/null", 
             "-o", "ExitOnForwardFailure=yes",
