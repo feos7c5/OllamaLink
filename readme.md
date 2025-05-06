@@ -11,7 +11,7 @@ OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models
 - **Flexible**: Use any Ollama model with Cursor
 - **Tunnel**: Works with Cursor's cloud service via localhost.run tunnels
 - **GUI & CLI**: Choose between graphical or command-line interface
-- **Model Mapping**: Map commercial model names to your local Ollama models
+- **Model Mapping**: Map custom model names to your local Ollama models
 - **Real-time Monitoring**: Track requests and responses in the GUI
 - **Secure**: Optional API key support for added security
 - **No Timeout Limits**: Long-running operations now supported without constraints
@@ -86,6 +86,12 @@ Choose the appropriate URL based on your needs:
    - Click the "Test Connection" button
    - You should see a success message
    - If you get an error, check the troubleshooting section below
+
+### Important Note on Model Names
+
+When setting up model mappings in `config.json`, please note:
+
+- You **cannot** use existing commercial model names like "gpt-4o" or "claude-3.5" as the model names in Cursor
 
 ### Common Setup Issues
 
