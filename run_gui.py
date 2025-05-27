@@ -33,6 +33,7 @@ class QTextEditLogger(logging.Handler):
         self.text_edit.setReadOnly(True)
         # Use Courier font instead of Monospace (more widely available)
         self.text_edit.setFont(QFont("Courier", 9))
+        # Initialize formatter properly
         self.formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
         # Add a signal to safely update the text edit from any thread
         self.signal = LoggerTextSignal()
@@ -40,9 +41,10 @@ class QTextEditLogger(logging.Handler):
 
     def emit(self, record):
         try:
-            msg = self.formatter.format(record)
-            # Use signal to safely update the UI from any thread
-            self.signal.signal.emit(record.levelname, msg)
+            if self.formatter:
+                msg = self.formatter.format(record)
+                # Use signal to safely update the UI from any thread
+                self.signal.signal.emit(record.levelname, msg)
         except Exception as e:
             print(f"Error in logger emit: {str(e)}")
     
@@ -135,11 +137,13 @@ class ServerThread(QThread):
             def __init__(self, signal):
                 super().__init__()
                 self.signal = signal
+                # Initialize formatter properly
                 self.formatter = logging.Formatter('%(levelname)s - %(name)s - %(message)s')
                 
             def emit(self, record):
-                msg = self.formatter.format(record)
-                self.signal.emit(msg)
+                if self.formatter:
+                    msg = self.formatter.format(record)
+                    self.signal.emit(msg)
         
         log_handler = SignalHandler(self.update_signal)
         log_handler.setLevel(logging.INFO)
@@ -551,9 +555,11 @@ class MainWindow(QMainWindow):
         self.setup_requests_tab(requests_tab)
         self.setup_settings_tab(settings_tab)
         
-        # Status bar
+        # Status bar - properly initialize
+        status_bar = self.statusBar()
         self.status_label = QLabel("Not Running")
-        self.statusBar().addWidget(self.status_label)
+        if status_bar:
+            status_bar.addWidget(self.status_label)
     
     def on_tab_changed(self, index):
         """Handle tab change events"""
@@ -683,16 +689,16 @@ class MainWindow(QMainWindow):
         # Model mapping table
         self.model_table = QTableWidget(0, 3)
         self.model_table.setHorizontalHeaderLabels(["API Model", "Ollama Model", "Resolved Model"])
-        self.model_table.horizontalHeader().setStretchLastSection(True)
+        header = self.model_table.horizontalHeader()
+        if header:
+            header.setStretchLastSection(True)
+            header.setStyleSheet("font-weight: bold; background-color: #e0e0e0;")
+            # Set column widths
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.model_table.setAlternatingRowColors(True)
         self.model_table.setStyleSheet("alternate-background-color: #f2f2f2; border: 1px solid #ddd; border-radius: 4px;")
-        self.model_table.horizontalHeader().setStyleSheet("font-weight: bold; background-color: #e0e0e0;")
-        
-        # Set column widths
-        header = self.model_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         
         models_layout.addWidget(self.model_table)
         
@@ -822,13 +828,13 @@ class MainWindow(QMainWindow):
         
         # Set column width distribution
         header = self.request_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Timestamp
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)           # Model
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Messages
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Status
-        
-        # Make sure the table takes the full width of its container
-        self.request_table.horizontalHeader().setStretchLastSection(False) 
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Timestamp
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)           # Model
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Messages
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)  # Status
+            # Make sure the table takes the full width of its container
+            header.setStretchLastSection(False)
         
         requests_layout.addWidget(self.request_table)
         
@@ -1091,16 +1097,22 @@ class MainWindow(QMainWindow):
         # Mappings table
         self.mappings_table = QTableWidget(0, 2)
         self.mappings_table.setHorizontalHeaderLabels(["API Model", "Ollama Model"])
-        self.mappings_table.horizontalHeader().setStretchLastSection(True)
+        header = self.mappings_table.horizontalHeader()
+        if header:
+            header.setStretchLastSection(True)
+            header.setStyleSheet("font-weight: bold; background-color: #e0e0e0;")
+            # Set column widths
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.mappings_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.mappings_table.setAlternatingRowColors(True)
         self.mappings_table.setStyleSheet("alternate-background-color: #f2f2f2; border: 1px solid #ddd; border-radius: 4px;")
-        self.mappings_table.horizontalHeader().setStyleSheet("font-weight: bold; background-color: #e0e0e0;")
         
         # Set column widths
         header = self.mappings_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        if header:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         
         # Add new mapping section
         mapping_form = QGroupBox("Add New Mapping")
@@ -1258,11 +1270,14 @@ class MainWindow(QMainWindow):
         
         # Add other mappings
         for row in range(self.mappings_table.rowCount()):
-            api_model = self.mappings_table.item(row, 0).text()
-            ollama_model = self.mappings_table.item(row, 1).text()
-            
-            if api_model and ollama_model:
-                mappings[api_model] = ollama_model
+            api_item = self.mappings_table.item(row, 0)
+            ollama_item = self.mappings_table.item(row, 1)
+            if api_item and ollama_item:
+                api_model = api_item.text()
+                ollama_model = ollama_item.text()
+                
+                if api_model and ollama_model:
+                    mappings[api_model] = ollama_model
         
         # Update config
         if "ollama" not in self.config:
@@ -1403,22 +1418,23 @@ class MainWindow(QMainWindow):
         url = self.tunnel_url_field.text()
         if url and url != "-" and url != "Disabled" and url != "Starting...":
             clipboard = QApplication.clipboard()
-            clipboard.setText(url)
-            logging.info(f"Copied to clipboard: {url}")
-            
-            # Show visual feedback
-            original_text = self.copy_tunnel_button.text()
-            original_style = self.copy_tunnel_button.styleSheet()
-            
-            self.copy_tunnel_button.setText("✓")
-            self.copy_tunnel_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 4px;")
-            
-            # Reset after a short delay
-            def reset_button():
-                self.copy_tunnel_button.setText(original_text)
-                self.copy_tunnel_button.setStyleSheet(original_style)
-            
-            QTimer.singleShot(1500, reset_button)
+            if clipboard:
+                clipboard.setText(url)
+                logging.info(f"Copied to clipboard: {url}")
+                
+                # Show visual feedback
+                original_text = self.copy_tunnel_button.text()
+                original_style = self.copy_tunnel_button.styleSheet()
+                
+                self.copy_tunnel_button.setText("✓")
+                self.copy_tunnel_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 4px;")
+                
+                # Reset after a short delay
+                def reset_button():
+                    self.copy_tunnel_button.setText(original_text)
+                    self.copy_tunnel_button.setStyleSheet(original_style)
+                
+                QTimer.singleShot(1500, reset_button)
 
     def update_tunnel_url(self, url):
         """Update the tunnel URL"""
@@ -1598,28 +1614,31 @@ class MainWindow(QMainWindow):
             
 
             try:
-                if hasattr(self.server_thread, 'server') and self.server_thread.server:
+                if self.server_thread and hasattr(self.server_thread, 'server') and self.server_thread.server:
                     def force_shutdown():
                         try:
-                            if hasattr(self.server_thread.server, "should_exit"):
-                                self.server_thread.server.should_exit = True
-                            if hasattr(self.server_thread.server, "force_exit"):
-                                self.server_thread.server.force_exit = True
-                            # Explicitly handle event loop closure for Lifespan
-                            if hasattr(self.server_thread, 'app') and self.server_thread.app:
-                                # Need to properly cleanup lifespan tasks
-                                if hasattr(self.server_thread.server, "lifespan"):
-                                    lifespan = self.server_thread.server.lifespan
-                                    if hasattr(lifespan, "shutdown_event"):
-                                        lifespan.shutdown_event.set()
-                                    if hasattr(lifespan, "receive_queue"):
-                                        # Clear any pending queue items to avoid blocking
-                                        try:
-                                            if not lifespan.receive_queue.empty():
-                                                while not lifespan.receive_queue.empty():
-                                                    lifespan.receive_queue.get_nowait()
-                                        except Exception:
-                                            pass
+                            server = getattr(self.server_thread, 'server', None)
+                            if server:
+                                if hasattr(server, "should_exit"):
+                                    server.should_exit = True
+                                if hasattr(server, "force_exit"):
+                                    server.force_exit = True
+                                # Explicitly handle event loop closure for Lifespan
+                                app = getattr(self.server_thread, 'app', None)
+                                if app:
+                                    # Need to properly cleanup lifespan tasks
+                                    lifespan = getattr(server, "lifespan", None)
+                                    if lifespan:
+                                        if hasattr(lifespan, "shutdown_event"):
+                                            lifespan.shutdown_event.set()
+                                        if hasattr(lifespan, "receive_queue"):
+                                            # Clear any pending queue items to avoid blocking
+                                            try:
+                                                if not lifespan.receive_queue.empty():
+                                                    while not lifespan.receive_queue.empty():
+                                                        lifespan.receive_queue.get_nowait()
+                                            except Exception:
+                                                pass
                         except Exception as e:
                             logging.error(f"Error in force_shutdown: {str(e)}")
                     
@@ -1768,10 +1787,11 @@ class MainWindow(QMainWindow):
                 self.request_table.setItem(i, 3, status_item)
             
             header = self.request_table.horizontalHeader()
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          
-            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  
-            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents) 
+            if header:
+                header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  
+                header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)          
+                header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  
+                header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             
             if (current_row < 0 or current_row >= self.request_table.rowCount()) and self.request_table.rowCount() > 0:
                 select_row = min(max(0, current_row), self.request_table.rowCount() - 1)
