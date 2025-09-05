@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; connect-src 'self' http://localhost:* https://localhost.run; img-src 'self' data:;">
+    <title>OllamaLink Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <nav class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fas fa-robot"></i>
+                    <span>OllamaLink</span>
+                </div>
+            </div>
+            <ul class="sidebar-menu">
+                <li class="menu-item active" data-tab="dashboard">
+                    <i class="fas fa-tachometer-alt"></i>
+                    <span>Dashboard</span>
+                </li>
+                <li class="menu-item" data-tab="console">
+                    <i class="fas fa-terminal"></i>
+                    <span>Console</span>
+                </li>
+                <li class="menu-item" data-tab="settings">
+                    <i class="fas fa-cog"></i>
+                    <span>Settings</span>
+                </li>
+            </ul>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="header">
+                <div class="header-left">
+                    <h1 class="page-title">Dashboard</h1>
+                </div>
+                <div class="header-right">
+                    <div class="server-status">
+                        <div class="status-indicator" id="serverStatus">
+                            <i class="fas fa-circle"></i>
+                        </div>
+                        <span id="serverStatusText">Starting...</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Dashboard Tab -->
+            <div class="tab-content active" id="dashboard">
+                <div class="dashboard-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>API Server</h3>
+                            <i class="fas fa-server"></i>
+                        </div>
+                        <div class="card-body">
+                            <div class="api-status">
+                                <div class="status-indicator">
+                                    <span id="api-status" class="status-light starting"></span>
+                                    <span id="api-status-text">Starting...</span>
+                                </div>
+                                <div class="api-info">
+                                    <p><strong>URL:</strong> <code id="api-url">http://localhost:8000</code></p>
+                                    <p><strong>Status:</strong> <span id="api-health">Checking...</span></p>
+                                </div>
+                            </div>
+                            <div class="button-group">
+                                <button id="restartApiBtn" class="btn btn-secondary">
+                                    <i class="fas fa-redo"></i> Restart
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Tunnel</h3>
+                            <i class="fas fa-globe"></i>
+                        </div>
+                        <div class="card-body">
+                            <div class="info-item">
+                                <label>Status:</label>
+                                <span id="tunnel-status-text" class="status-badge offline">Offline</span>
+                            </div>
+                            <div class="info-item" id="tunnel-url-item" style="display: none;">
+                                <label>Cursor URL:</label>
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <a id="cursor-url-link" href="#" target="_blank" style="color: #4CAF50; text-decoration: none; font-family: monospace; font-size: 12px; flex: 1;">-</a>
+                                    <button id="copy-cursor-url" class="btn btn-primary btn-sm">
+                                        <i class="fas fa-copy"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>Providers</h3>
+                            <i class="fas fa-cloud"></i>
+                        </div>
+                        <div class="card-body">
+                            <div id="providerStatus">
+                                <div class="loading">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+
+
+            <!-- Console Tab -->
+            <div class="tab-content" id="console">
+                <div class="console-container">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>System Logs</h3>
+                            <div class="header-actions">
+                                <button id="clearLogsBtn" class="btn btn-sm" onclick="app.clearLogs()">
+                                    <i class="fas fa-trash"></i> Clear
+                                </button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div id="consoleOutput" class="console-output"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div class="tab-content" id="settings">
+                <div class="settings-container">
+                    <div class="settings-header">
+                        <h2>Configuration</h2>
+                        <div class="header-actions">
+                            <button id="saveConfigBtn" class="btn btn-primary">
+                                <i class="fas fa-save"></i> Save
+                            </button>
+                            <button id="resetConfigBtn" class="btn btn-secondary">
+                                <i class="fas fa-undo"></i> Reset
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-grid">
+                        <!-- OpenRouter -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>OpenRouter</h3>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="openrouterEnabled">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="card-body">
+                                <div class="control-group">
+                                    <label>API Key:</label>
+                                    <input type="password" id="openrouterApiKey" class="form-input" placeholder="Enter API Key">
+                                </div>
+                                <div class="control-group">
+                                    <label>Endpoint:</label>
+                                    <input type="text" id="openrouterEndpoint" class="form-input" placeholder="https://openrouter.ai">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Ollama -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Ollama</h3>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="ollamaEnabled" checked>
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="card-body">
+                                <div class="control-group">
+                                    <label>Endpoint:</label>
+                                    <input type="text" id="ollamaEndpoint" class="form-input" placeholder="http://localhost:11434">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Llama.cpp -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Llama.cpp</h3>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="llamacppEnabled">
+                                    <span class="slider"></span>
+                                </label>
+                            </div>
+                            <div class="card-body">
+                                <div class="control-group">
+                                    <label>Endpoint:</label>
+                                    <input type="text" id="llamacppEndpoint" class="form-input" placeholder="http://localhost:8080">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Server -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h3>Server</h3>
+                            </div>
+                            <div class="card-body">
+                                <div class="control-group">
+                                    <label>Port:</label>
+                                    <input type="number" id="serverPort" class="form-input" value="8000" min="1024" max="65535">
+                                </div>
+                                <div class="control-group">
+                                    <label>Host:</label>
+                                    <input type="text" id="serverHostname" class="form-input" placeholder="127.0.0.1">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+
+    <script src="app-simple.js"></script>
+</body>
+</html>

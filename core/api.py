@@ -1,18 +1,34 @@
 import logging
-import json
-import time
 import uuid
-import httpx
+import time
+import json
+import sys
+import argparse
+from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from .router import OllamaRouter
-from .request import OllamaRequestHandler
-from .response import OllamaResponseHandler
-from .util import load_config
+
+# Constants
+DEFAULT_VERIFICATION_PROMPT_TOKENS = 10
+DEFAULT_VERIFICATION_COMPLETION_TOKENS = 8
+CURSOR_VERIFICATION_KEYWORDS = ["test", "hello", "hi", "ping", "verify", "check", "connection"]
+MAX_VERIFICATION_MESSAGE_LENGTH = 20
+from .router import Router
+from .util import load_config, start_localhost_run_tunnel
+from .handlers import (
+    OllamaRequestHandler, OllamaResponseHandler,
+    OpenRouterRequestHandler, OpenRouterResponseHandler,
+    LlamaCppRequestHandler, LlamaCppResponseHandler
+)
+import uvicorn
 
 logger = logging.getLogger(__name__)
-
+ 
+tunnel_process = None
+tunnel_url = None
+tunnel_port = None
+        
 def create_api(
     ollama_endpoint=None,
     api_key=None,
@@ -21,164 +37,49 @@ def create_api(
     """Create a new FastAPI instance with all routes configured"""
     app = FastAPI(title="OllamaLink")
 
+    # Initialize components with proper error handling
+    router = None
+    ollama_request_handler = None
+    ollama_response_handler = None
+    openrouter_request_handler = None
+    openrouter_response_handler = None
+    llamacpp_request_handler = None
+    llamacpp_response_handler = None
+    
     try:
-        config = load_config()
+        router = Router(ollama_endpoint=ollama_endpoint, config_path=Path("config.json"))
+        logger.info("Router initialized successfully")
     except Exception as e:
-        logger.error(f"Error loading config: {str(e)}")
-        config = {
-            "ollama": {
-                "endpoint": ollama_endpoint or "http://localhost:11434",
-                "model_mappings": {"default": "llama3"}
-            }
-        }
-
-    if ollama_endpoint:
-        config["ollama"]["endpoint"] = ollama_endpoint
-
-    if api_key:
-        if "openai" not in config:
-            config["openai"] = {}
-        config["openai"]["api_key"] = api_key
-
-    ollama_endpoint = config["ollama"]["endpoint"]
-
-    router = OllamaRouter(ollama_endpoint=ollama_endpoint)
+        logger.error(f"Failed to initialize router: {str(e)}")
+        logger.error("Server will start with limited functionality")
     
-    if "thinking_mode" in config["ollama"]:
-        router.thinking_mode = config["ollama"]["thinking_mode"]
-    if "skip_integrity_check" in config["ollama"]:
-        router.skip_integrity_check = config["ollama"]["skip_integrity_check"]
-
-    response_handler = OllamaResponseHandler()
-    
-    if not hasattr(response_handler, 'format_streaming_chunk'):
-        def format_streaming_chunk(chunk, model, message_id):
-            """Format a streaming chunk as an OpenAI-compatible response."""
-            created_time = int(time.time())
-            
-            if isinstance(chunk, dict) and "error" in chunk:
-                return {
-                    "error": {
-                        "message": chunk["error"].get("message", "Unknown error"),
-                        "code": chunk["error"].get("code", 500)
-                    }
-                }
-            
-            content = None
-            if isinstance(chunk, dict) and "message" in chunk and "content" in chunk["message"]:
-                content = chunk["message"]["content"]
-            
-            formatted_chunk = {
-                "id": message_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {}
-                }]
-            }
-            
-            if content:
-                formatted_chunk["choices"][0]["delta"]["content"] = content
-            
-            if isinstance(chunk, dict) and chunk.get("done", False):
-                formatted_chunk["choices"][0]["finish_reason"] = "stop"
-            else:
-                formatted_chunk["choices"][0]["finish_reason"] = None
-                
-            return formatted_chunk
+    try:
+        config = load_config(Path("config.json"))
         
-        response_handler.format_streaming_chunk = format_streaming_chunk
-
-    max_streaming_tokens = config["ollama"].get("max_streaming_tokens", 32000)
-    max_tokens_per_chunk = config["ollama"].get("max_tokens_per_chunk", 8000)
-
-    request_handler = OllamaRequestHandler(
-        ollama_endpoint=ollama_endpoint,
-        response_handler=response_handler,
-        max_tokens_per_chunk=max_tokens_per_chunk,
-        max_streaming_tokens=max_streaming_tokens
-    )
-
-    if not hasattr(request_handler, 'prepare_ollama_request'):
-        def prepare_ollama_request(model, messages, temperature=0.7, max_tokens=None):
-            """Prepare a request for Ollama"""
-            ollama_model = router.get_model_name(model)
-            
-            processed_messages = router.process_messages(messages)
-            
-            sanitized_messages = []
-            for msg in processed_messages:
-                sanitized_msg = msg.copy()
-                if "content" in sanitized_msg and isinstance(sanitized_msg["content"], list):
-                    content_parts = []
-                    for item in sanitized_msg["content"]:
-                        if isinstance(item, dict):
-                            if item.get("type") == "text" and "text" in item:
-                                content_parts.append(item["text"])
-                        elif isinstance(item, str):
-                            content_parts.append(item)
-                    sanitized_msg["content"] = " ".join(content_parts)
-                sanitized_messages.append(sanitized_msg)
-            
-            request_data = {
-                "model": ollama_model,
-                "messages": sanitized_messages,
-                "stream": True 
-            }
-            
-            if temperature is not None:
-                request_data["temperature"] = temperature
-            if max_tokens is not None:
-                request_data["max_tokens"] = max_tokens
-                
-            return request_data
+        ollama_endpoint_url = ollama_endpoint or config.get("ollama", {}).get("endpoint", "http://localhost:11434")
+        ollama_request_handler = OllamaRequestHandler(endpoint=ollama_endpoint_url)
+        ollama_response_handler = OllamaResponseHandler()
         
-        request_handler.prepare_ollama_request = prepare_ollama_request
-    
-    if not hasattr(request_handler, 'make_ollama_request'):
-        if hasattr(request_handler, '_make_ollama_request'):
-            request_handler.make_ollama_request = request_handler._make_ollama_request
+        openrouter_config = config.get("openrouter", {})
+        openrouter_api_key = openrouter_config.get("api_key", "")
+        if openrouter_api_key:
+            openrouter_request_handler = OpenRouterRequestHandler(
+                endpoint=openrouter_config.get("endpoint", "https://openrouter.ai/api/v1"),
+                api_key=openrouter_api_key
+            )
         else:
-            async def make_ollama_request(request_data):
-                """Make a non-streaming request to Ollama"""
-                url = f"{ollama_endpoint}/api/chat"
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, json=request_data, timeout=90)
-                    if response.status_code == 200:
-                        return response.json()
-                    else:
-                        return {"error": {"message": f"Error: {response.status_code}", "code": response.status_code}}
-            
-            request_handler.make_ollama_request = make_ollama_request
-    
-    if not hasattr(request_handler, 'stream_ollama_request'):
-        if hasattr(request_handler, 'handle_chat_request'):
-            async def stream_ollama_request(model, messages, temperature=0.7, max_tokens=None):
-                """Stream a request to Ollama"""
-                request_data = request_handler.prepare_ollama_request(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                request_data["stream"] = True
-                
-                response = await request_handler._make_ollama_request(request_data)
-                if isinstance(response, httpx.Response):
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            yield json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                else:
-                    yield response
-            
-            request_handler.stream_ollama_request = stream_ollama_request
-
+            openrouter_request_handler = None
+        openrouter_response_handler = OpenRouterResponseHandler()
+        
+        llamacpp_config = config.get("llamacpp", {})
+        llamacpp_request_handler = LlamaCppRequestHandler(
+            endpoint=llamacpp_config.get("endpoint", "http://localhost:8080")
+        )
+        llamacpp_response_handler = LlamaCppResponseHandler()
+        logger.info("All handlers initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize handlers: {str(e)}")
+        logger.error("Server will start with limited functionality")
 
     app.add_middleware(
         CORSMiddleware,
@@ -205,7 +106,7 @@ def create_api(
                 token_type, token = auth_header.split()
                 if token_type.lower() != "bearer":
                     raise ValueError("Invalid token type")
-            except:
+            except (ValueError, IndexError):
                 return JSONResponse(
                     status_code=401,
                     content={"error": {"message": "Invalid Authorization header", "code": "invalid_auth_header"}}
@@ -235,7 +136,7 @@ def create_api(
                         "type": "request",
                         "request": request_data
                     })
-                except:
+                except (json.JSONDecodeError, ValueError):
                     pass
                     
             class ResponseInterceptor(StreamingResponse):
@@ -384,7 +285,6 @@ def create_api(
                     })
                 raise
 
-    # Define routes
     @app.get("/v1")
     async def api_info():
         """API root - provides basic info"""
@@ -398,10 +298,89 @@ def create_api(
     async def list_models():
         """List available models"""
         try:
-            models = router.get_available_models()
+            if router is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": "Router not initialized", "code": "service_unavailable"}}
+                )
+            models = await router.get_available_models()
             return {"data": models, "object": "list"}
         except Exception as e:
             logger.error(f"Error listing models: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(e), "code": "internal_error"}}
+            )
+    
+    @app.get("/v1/providers/status")
+    async def provider_status():
+        """Get status of all providers"""
+        try:
+            if router is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": "Router not initialized", "code": "service_unavailable"}}
+                )
+            status = router.get_provider_status()
+            return status
+        except Exception as e:
+            logger.error(f"Error getting provider status: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(e), "code": "internal_error"}}
+            )
+    
+    @app.get("/api/providers/status")
+    async def gui_provider_status():
+        """Get provider status formatted for GUI"""
+        try:
+            if router is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": "Router not initialized", "code": "service_unavailable"}}
+                )
+            
+            status = router.get_provider_status()
+            
+            # Format for GUI consumption
+            gui_status = {
+                "providers": {
+                    "ollama": {
+                        "name": "Ollama",
+                        "enabled": status["ollama"]["enabled"],
+                        "healthy": status["ollama"]["healthy"],
+                        "models": status["ollama"]["models"],
+                        "endpoint": status["ollama"]["endpoint"],
+                        "status": "connected" if status["ollama"]["healthy"] else "disconnected",
+                        "error": None if status["ollama"]["healthy"] else "Connection failed"
+                    },
+                    "openrouter": {
+                        "name": "OpenRouter",
+                        "enabled": status["openrouter"]["enabled"],
+                        "healthy": status["openrouter"]["healthy"],
+                        "models": status["openrouter"]["models"],
+                        "endpoint": status["openrouter"]["endpoint"],
+                        "status": "connected" if status["openrouter"]["healthy"] else "disconnected",
+                        "error": None if status["openrouter"]["healthy"] else "API key or connection issue"
+                    },
+                    "llamacpp": {
+                        "name": "Llama.cpp",
+                        "enabled": status["llamacpp"]["enabled"],
+                        "healthy": status["llamacpp"]["healthy"],
+                        "models": status["llamacpp"]["models"],
+                        "endpoint": status["llamacpp"]["endpoint"],
+                        "status": "connected" if status["llamacpp"]["healthy"] else "disconnected",
+                        "error": None if status["llamacpp"]["healthy"] else "Server not available"
+                    }
+                },
+                "routing": status["routing"],
+                "timestamp": int(time.time())
+            }
+            
+            return gui_status
+            
+        except Exception as e:
+            logger.error(f"Error getting GUI provider status: {str(e)}")
             return JSONResponse(
                 status_code=500,
                 content={"error": {"message": str(e), "code": "internal_error"}}
@@ -416,15 +395,26 @@ def create_api(
             user_agent = request.headers.get("User-Agent", "")
             is_cursor = "Cursor" in user_agent
             
-            if is_cursor and not body.get("stream", False):
+            # Detect Cursor verification requests
+            model = body.get("model")
+            messages = body.get("messages", [])
+            is_cursor_verification = False
+            
+            if is_cursor and model in ["gpt-4o", "gpt-4", "gpt-3.5-turbo"] and len(messages) == 1:
+                # Check if it's a short test message (typical verification)
+                user_message = messages[0].get("content", "").lower().strip()
+                if any(keyword in user_message for keyword in CURSOR_VERIFICATION_KEYWORDS) or len(user_message) < MAX_VERIFICATION_MESSAGE_LENGTH:
+                    is_cursor_verification = True
+                    logger.info(f"Detected Cursor verification request for {model}: '{user_message}'")
+            
+            # Don't force streaming for verification requests
+            if is_cursor and not is_cursor_verification and not body.get("stream", False):
                 logger.info("Forcing streaming mode for Cursor client")
                 body["stream"] = True
                 
             stream = body.get("stream", False)
-            
-            model = body.get("model", "gpt-3.5-turbo")
-            messages = body.get("messages", [])
             temperature = body.get("temperature", 0.7)
+            provider = body.get("provider", None) 
             
             max_tokens = body.get("max_tokens", None)
             if max_tokens is None:
@@ -434,60 +424,122 @@ def create_api(
                     
             if max_tokens is not None:
                 max_tokens = int(max_tokens)
-                        
-            ollama_request = request_handler.prepare_ollama_request(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
             
-            if stream:
-                async def generate_streaming_response():
-                    try:
-                        request_id = str(uuid.uuid4())
-                        
-                        async for chunk in request_handler.stream_ollama_request(
-                            model=model,
-                            messages=messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens
-                        ):
-                            formatted_chunk = response_handler.format_streaming_chunk(chunk, model, request_id)
-                            yield f"data: {json.dumps(formatted_chunk)}\n\n"
-                            
-                        yield "data: [DONE]\n\n"
-                        
-                    except Exception as e:
-                        logger.error(f"Error in streaming: {str(e)}")
-                        error_json = json.dumps({
-                            "error": {
-                                "message": str(e),
-                                "code": "stream_error"
-                            }
-                        })
-                        yield f"data: {error_json}\n\n"
-                        yield "data: [DONE]\n\n"
+            # Handle Cursor verification requests with direct response
+            if is_cursor_verification:
+                logger.info("Responding to Cursor verification with direct response")
+                verification_response = {
+                    "id": f"chatcmpl-{str(uuid.uuid4())[:8]}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Connection verified. OllamaLink is ready!"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": DEFAULT_VERIFICATION_PROMPT_TOKENS,
+                        "completion_tokens": DEFAULT_VERIFICATION_COMPLETION_TOKENS,
+                        "total_tokens": DEFAULT_VERIFICATION_PROMPT_TOKENS + DEFAULT_VERIFICATION_COMPLETION_TOKENS
+                    },
+                    "system_fingerprint": "ollamalink-server"
+                }
                 
-                return StreamingResponse(
-                    generate_streaming_response(),
-                    media_type="text/event-stream"
-                )
-                
-            else:
-                try:
-                    ollama_response = await request_handler.make_ollama_request(ollama_request)
-                
-                    formatted_response = response_handler.format_openai_response(ollama_response, model)
+                if stream:
+                    # Return streaming response for verification
+                    async def generate_verification_stream():
+                        chunk = {
+                            "id": verification_response["id"],
+                            "object": "chat.completion.chunk",
+                            "created": verification_response["created"],
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": "Connection verified. OllamaLink is ready!"},
+                                "finish_reason": "stop"
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\\n\\n"
+                        yield "data: [DONE]\\n\\n"
                     
-                    return formatted_response
-                    
-                except Exception as e:
-                    logger.error(f"Error in chat completion: {str(e)}")
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": {"message": str(e), "code": "completion_error"}}
+                    return StreamingResponse(
+                        generate_verification_stream(),
+                        media_type="text/event-stream"
                     )
+                else:
+                    # Return proper OpenAI format for non-streaming
+                    return JSONResponse(
+                        content=verification_response,
+                        status_code=200
+                    )
+            
+            # Check if explicit provider selection is requested
+            if provider:
+                # Use explicit provider selection
+                route_result = await router.make_request_with_provider(
+                    provider=provider,
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=stream
+                )
+            else:
+                route_result = await router.make_request(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=stream
+                )
+            
+            # Check if router returned an error that should be passed through
+            if route_result.get("error"):
+                return JSONResponse(
+                    status_code=route_result["error"].get("code", 500),
+                    content={"error": route_result["error"]}
+                )
+            
+            provider = route_result.get("provider")
+            display_model = route_result.get("display_model", model)
+            
+            if route_result.get("fallback"):
+                logger.info(f"Using fallback provider: {provider}")
+            
+            # Use router's result directly instead of separate handlers
+            if route_result.get("stream"):
+                # Router returned streaming result
+                return StreamingResponse(
+                    route_result["stream_generator"],
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"
+                    }
+                )
+            elif route_result.get("result"):
+                # Router returned non-streaming result
+                result = route_result["result"]
+                if isinstance(result, dict) and "error" in result:
+                    return JSONResponse(
+                        status_code=result["error"].get("code", 500),
+                        content={"error": result["error"]}
+                    )
+                else:
+                    # Format as OpenAI response
+                    return JSONResponse(content=result)
+            
+            # If we reach here, router failed to handle request properly
+            logger.error(f"Router failed to handle request for model {model}, provider {provider}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": "Internal routing error", "code": "routing_error"}}
+            )
                 
         except Exception as e:
             logger.error(f"Error processing chat completion request: {str(e)}")
@@ -495,6 +547,156 @@ def create_api(
                 status_code=400,
                 content={"error": {"message": str(e), "code": "invalid_request"}}
             )
+    
+    @app.post("/api/tunnel/start")
+    async def start_tunnel(request: Request):
+        """Start a localhost.run tunnel"""
+        global tunnel_process, tunnel_url, tunnel_port
+        
+        try:
+            body = await request.json()
+            port = body.get("port", 8000)
+            
+            if tunnel_process is not None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"message": "Tunnel already running", "code": "tunnel_active"}}
+                )
+            
+            logger.info(f"Starting localhost.run tunnel for port {port}...")
+            
+            result = await start_localhost_run_tunnel(port)
+            
+            if not result:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": "Failed to start tunnel", "code": "tunnel_start_failed"}}
+                )
+            
+            tunnel_url, tunnel_process = result
+            tunnel_port = port
+            
+            cursor_url = f"{tunnel_url}/v1"
+            
+            logger.info(f"Tunnel started successfully: {tunnel_url}")
+            
+            return {
+                "success": True,
+                "tunnel_url": tunnel_url,
+                "cursor_url": cursor_url,
+                "port": port,
+                "status": "running"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error starting tunnel: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(e), "code": "tunnel_error"}}
+            )
+    
+    @app.post("/api/tunnel/stop")
+    async def stop_tunnel():
+        """Stop the localhost.run tunnel"""
+        global tunnel_process, tunnel_url, tunnel_port
+        
+        try:
+            if tunnel_process is None:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"message": "No tunnel running", "code": "no_tunnel"}}
+                )
+            
+            logger.info("Stopping tunnel...")
+            
+            if hasattr(tunnel_process, 'terminate'):
+                tunnel_process.terminate()
+            elif hasattr(tunnel_process, 'kill'):
+                tunnel_process.kill()
+            
+            # Reset global state
+            tunnel_process = None
+            tunnel_url = None
+            tunnel_port = None
+            
+            logger.info("Tunnel stopped successfully")
+            
+            return {
+                "success": True,
+                "status": "stopped"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error stopping tunnel: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(e), "code": "tunnel_stop_error"}}
+            )
+    
+    @app.get("/api/tunnel/status")
+    async def get_tunnel_status():
+        """Get current tunnel status"""
+        global tunnel_process, tunnel_url, tunnel_port
+        
+        is_running = tunnel_process is not None
+        cursor_url = f"{tunnel_url}/v1" if tunnel_url else None
+        
+        return {
+            "running": is_running,
+            "tunnel_url": tunnel_url,
+            "cursor_url": cursor_url,
+            "port": tunnel_port,
+            "status": "running" if is_running else "stopped"
+        }
 
     return app
+
+
+def setup_logging():
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+
+def main():
+    """Main function to run the API server"""
+    parser = argparse.ArgumentParser(description='OllamaLink API Server')
+    parser.add_argument('--host', default='localhost', help='Host to bind to (default: localhost)')
+    parser.add_argument('--port', type=int, default=8000, help='Port to bind to (default: 8000)')
+    parser.add_argument('--reload', action='store_true', help='Enable auto-reload for development')
+    parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warning', 'error'], 
+                       help='Log level (default: info)')
+    
+    args = parser.parse_args()
+    
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    
+    try:
+        config = load_config(Path("config.json"))
+        app = create_api()
+
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            log_level=args.log_level,
+            access_log=True
+        )
+        
+    except KeyboardInterrupt:
+        logger.info("Server shutdown requested by user")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 

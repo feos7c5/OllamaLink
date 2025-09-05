@@ -22,15 +22,16 @@ def is_valid_url(url: str) -> bool:
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
-    except:
+    except (ValueError, TypeError):
         return False
 
-def load_config() -> Dict[str, Any]:
+def load_config(config_path) -> Dict[str, Any]:
     """
     Load configuration from config.json with fallbacks to defaults.
     """
     try:
-        config_path = Path("config.json")
+        if isinstance(config_path, str):
+            config_path = Path(config_path)
         
         if not config_path.exists():
             default_config = {

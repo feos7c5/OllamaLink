@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Ollamalink"
+version = "1.0.0"
+description = "A bridge application connecting local Ollama models or OpenRouter.ai for hybrid AI model access"
+readme = "readme.md"
+license = {file = "license.md"}
+authors = [
+    {name = "Pascal Seeber", email = "pascal.seeber@example.com"}
+]
+maintainers = [
+    {name = "Pascal Seeber", email = "pascal.seeber@example.com"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["ollama", "openrouter", "ai", "llm", "api", "bridge"]
+requires-python = ">=3.8"
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.15.0",
+    "starlette>=0.46.0",
+    "pillow>=8.3.1",
+    "python-multipart>=0.0.5",
+    "aiofiles>=0.7.0",
+    "requests>=2.26.0",
+    "pyfiglet==1.0.2",
+    "termcolor==2.3.0",
+    "setuptools==65.6.3",
+    "PyQt6==6.5.2",
+    "tiktoken==0.9.0",
+    "httpx==0.25.1",
+]
+
+[project.optional-dependencies]
+packaging = [
+    "py2app==0.28.6; sys_platform == 'darwin'",
+    "pyinstaller==6.1.0; sys_platform == 'win32'",
+]
+dev = [
+    "pytest>=6.0",
+    "pytest-asyncio",
+    "black",
+    "flake8",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/pascalseeber/ollamalink"
+Repository = "https://github.com/pascalseeber/ollamalink"
+Issues = "https://github.com/pascalseeber/ollamalink/issues"
+Documentation = "https://github.com/pascalseeber/ollamalink#readme"
+
+[project.scripts]
+ollamalink = "run_cli:main"
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+asyncio_mode = "auto"

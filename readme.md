@@ -1,17 +1,20 @@
 # OllamaLink
 
-**Connect Cursor AI to your local Ollama models**
+**Connect Cursor AI to your local Ollama models or OpenRouter.ai**
 
-OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models. It comes in both GUI and CLI versions, offering flexibility in how you want to manage your Ollama connections.
+OllamaLink is a bridge application that connects Cursor AI to your local Ollama models or cloud-based OpenRouter.ai models. It supports hybrid model access, allowing you to use both local and cloud models seamlessly. Currently, only the CLI version is functional with full Ollama and OpenRouter integration. The GUI is not yet available.
 
 ## Features
 
+- **Hybrid Model Access**: Connect to both local Ollama models and cloud OpenRouter.ai models
 - **Simple**: Minimal setup, just run and go
-- **Private**: Your code stays on your machine
-- **Flexible**: Use any Ollama model with Cursor
+- **Private**: Your code stays on your machine with local models
+- **Flexible**: Use any Ollama or OpenRouter model with Cursor
+- **Intelligent Routing**: Automatic provider selection and fallback mechanisms
 - **Tunnel**: Works with Cursor's cloud service via localhost.run tunnels
-- **GUI & CLI**: Choose between graphical or command-line interface
-- **Model Mapping**: Map custom model names to your local Ollama models
+- **CLI Only**: Currently only command-line interface is available with full functionality
+- **GUI**: Graphical interface is in development (not yet available)
+- **Model Mapping**: Map custom model names to your local Ollama or cloud models
 - **Real-time Monitoring**: Track requests and responses in the GUI
 - **Secure**: Optional API key support for added security
 - **No Timeout Limits**: Long-running operations now supported without constraints
@@ -28,20 +31,19 @@ OllamaLink is a simple proxy that connects Cursor AI to your local Ollama models
    Install the necessary dependencies using pip:
    ```sh
    pip install -r requirements.txt
+   # Or using the modern pyproject.toml:
+   pip install -e .
    ```
 
 3. **Run OllamaLink**:
-   Choose your preferred interface:
+   Currently only the CLI version is available:
 
-   **GUI Version**:
-   ```sh
-   python run_gui.py
-   ```
-   
-   **CLI Version**:
+   **CLI Version** (Full Ollama + OpenRouter support):
    ```sh
    python run_cli.py
    ```
+   
+   **Note**: GUI version is not yet functional and is currently in development.
 
 ## Setting Up Cursor
 
@@ -138,6 +140,23 @@ You can customize OllamaLink using a `config.json` file in the project root:
         "skip_integrity_check": true,
         "max_streaming_tokens": 32000
     },
+    "openrouter": {
+        "enabled": false,
+        "api_key": "sk-or-1234567890",
+        "endpoint": "https://openrouter.ai/api/v1",
+        "model_mappings": {
+            "gpt-4o": "openai/gpt-4o",
+            "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet",
+            "llama-3.1-405b": "meta-llama/llama-3.1-405b-instruct"
+        },
+        "priority": 2,
+        "fallback_enabled": true
+    },
+    "routing": {
+        "provider_priority": ["ollama", "openrouter"],
+        "fallback_enabled": true,
+        "health_check_interval": 30
+    },
     "server": {
         "port": 8080,
         "hostname": "127.0.0.1"
@@ -149,14 +168,43 @@ You can customize OllamaLink using a `config.json` file in the project root:
 }
 ```
 
-## GUI Features
+## OpenRouter Setup (CLI Only)
 
-The graphical interface provides:
+To enable OpenRouter.ai cloud models:
 
-- **Dashboard**: View server status and model mappings
-- **Console**: Real-time server logs and events
-- **Requests/Responses**: Monitor API traffic
-- **Settings**: Configure server and model mappings
+1. **Get an OpenRouter API Key**:
+   - Visit [OpenRouter.ai](https://openrouter.ai/) and create an account
+   - Generate an API key from your dashboard
+
+2. **Configure OpenRouter in config.json**:
+   ```json
+   "openrouter": {
+       "enabled": true,
+       "api_key": "sk-or-your-api-key-here",
+       "model_mappings": {
+           "gpt-4o": "openai/gpt-4o",
+           "claude-3.5-sonnet": "anthropic/claude-3.5-sonnet"
+       }
+   }
+   ```
+
+3. **Run with CLI**:
+   ```sh
+   python run_cli.py
+   ```
+   The system will automatically route requests between local Ollama and OpenRouter based on model availability and your configured priorities.
+
+## GUI Status
+
+⚠️ **The GUI is currently not functional and is in development.** 
+
+Planned GUI features (not yet available):
+- Dashboard for server status and model mappings
+- Console for real-time server logs and events
+- Request/Response monitoring
+- Settings configuration
+
+For now, please use the CLI version which has all functionality implemented.
 
 ## CLI Usage
 
@@ -193,24 +241,18 @@ OllamaLink provides flexible model mapping that allows you to route requests for
 
 ### macOS App Bundle
 
-Build using py2app:
+Build using py2app (CLI only, GUI not yet available):
 
 ```sh
-# GUI Version
-python setup.py py2app
-
 # CLI Version
 python setup.py py2app --cli
 ```
 
 ### Windows Executable
 
-Build using PyInstaller:
+Build using PyInstaller (CLI only, GUI not yet available):
 
 ```sh
-# GUI Version
-pyinstaller --name OllamaLink-GUI --onefile --windowed --icon=icon.ico --add-data "config.json;." run_gui.py
-
 # CLI Version
 pyinstaller --name OllamaLink-CLI --onefile --console --icon=icon.ico --add-data "config.json;." run_cli.py
 ```
@@ -269,6 +311,15 @@ Try these steps:
    In Cursor, make sure you're using mapped model names
 
 ## Recent Changes
+
+### OpenRouter.ai Integration (CLI)
+- **NEW**: Full OpenRouter.ai cloud model support in CLI version
+- Hybrid model access with intelligent routing between local Ollama and cloud OpenRouter
+- Automatic provider fallback when primary provider is unavailable
+- Cost optimization with configurable provider priority (local-first by default)
+- Support for all major OpenRouter models (GPT-4, Claude, Llama, etc.)
+- Real-time provider health monitoring
+- **Note**: GUI support for OpenRouter is currently in development
 
 ### Tunneling Improvements
 - Switched to localhost.run for more reliable connections

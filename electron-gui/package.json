@@ -1,0 +1,57 @@
+{
+  "name": "ollamalink-gui",
+  "version": "0.1.0", 
+  "description": "Modern Electron GUI for OllamaLink with multi-provider AI support",
+  "main": "src/main.js",
+  "homepage": "./",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "build-win": "electron-builder --win",
+    "build-mac": "electron-builder --mac",
+    "build-linux": "electron-builder --linux",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "keywords": [
+    "ollama",
+    "openrouter",
+    "ai",
+    "llm",
+    "api",
+    "proxy"
+  ],
+  "author": "OllamaLink",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.6.4"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "electron-store": "^8.1.0"
+  },
+  "build": {
+    "appId": "com.ollamalink.gui",
+    "productName": "OllamaLink",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "node_modules/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

@@ -3,14 +3,17 @@ import argparse
 import logging
 from pathlib import Path
 import json
+import requests
+import time
+import threading
 
 import uvicorn
 import termcolor
 from pyfiglet import Figlet
 
 from core.api import create_api
-from core.router import OllamaRouter
-from core.util import load_config, start_localhost_run_tunnel
+from core.router import Router
+from core.util import load_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,24 +29,67 @@ SUCCESS_COLOR = 'green'
 CODE_COLOR = 'cyan'
 DIVIDER = "─" * 60
 
-async def start_tunnel_cli(port):
-    """
-    Start a localhost.run tunnel and handle CLI-specific output.
+
+def auto_start_tunnel(port, host="127.0.0.1"):
+    """Auto-start tunnel via API call with status feedback"""
+    api_base_url = f"http://{host}:{port}"
     
-    This is a wrapper around the core utility function that adds
-    CLI-specific colored output.
-    """
-    print(termcolor.colored("🔄 Starting localhost.run tunnel...", INFO_COLOR))
+    print(termcolor.colored("Waiting for server to be ready...", INFO_COLOR))
     
-    result = await start_localhost_run_tunnel(port)
+    # Wait for server to be ready
+    max_retries = 10
+    for i in range(max_retries):
+        try:
+            response = requests.get(f"{api_base_url}/api/tunnel/status", timeout=3)
+            if response.status_code == 200:
+                break
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(1)
+    else:
+        print(termcolor.colored("Error: Server not ready after 10 seconds", ERROR_COLOR))
+        return
     
-    if not result:
-        print(termcolor.colored("❌ Could not get tunnel URL. Check output above.", ERROR_COLOR))
-        return None
+    print(termcolor.colored("Starting tunnel...", INFO_COLOR))
     
-    tunnel_url, process = result
-    print(termcolor.colored(f"✅ Tunnel started at: {tunnel_url}", SUCCESS_COLOR))
-    return tunnel_url
+    try:
+        response = requests.post(
+            f"{api_base_url}/api/tunnel/start",
+            json={"port": port},
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            tunnel_url = data.get("tunnel_url")
+            cursor_url = data.get("cursor_url")
+            
+            if tunnel_url:
+                print(f"\n{DIVIDER}")
+                print(termcolor.colored(f"✅ Tunnel started successfully!", SUCCESS_COLOR, attrs=['bold']))
+                print(f"{DIVIDER}\n")
+                print(termcolor.colored("Use this URL in Cursor AI:", INFO_COLOR, attrs=['bold']))
+                print(termcolor.colored(f"{cursor_url}", CODE_COLOR, attrs=['bold']))
+                print()
+                print(termcolor.colored("Instructions:", INFO_COLOR, attrs=['bold']))
+                print("1. In Cursor, go to settings > AI > Configure AI Provider")
+                print("2. Choose OpenAI Compatible and paste the URL above")
+                print("3. Chat with local Ollama models in Cursor!")
+                print()
+                print(termcolor.colored("Press CTRL+C to stop the server and tunnel", INFO_COLOR))
+                print()
+            else:
+                print(termcolor.colored("Error: No tunnel URL received from API", ERROR_COLOR))
+        else:
+            error_data = response.json() if response.headers.get('content-type') == 'application/json' else {}
+            error_message = error_data.get('error', {}).get('message', f'HTTP {response.status_code}')
+            print(termcolor.colored(f"Error: Could not start tunnel: {error_message}", ERROR_COLOR))
+            
+    except requests.exceptions.RequestException as e:
+        print(termcolor.colored(f"Error: Could not connect to API: {str(e)}", ERROR_COLOR))
+    except Exception as e:
+        print(termcolor.colored(f"Error: {str(e)}", ERROR_COLOR))
+
 
 def display_model_error(error_message, error_type):
     """
@@ -54,13 +100,13 @@ def display_model_error(error_message, error_type):
         error_type: The type of error (model_not_found, model_corrupted, etc.)
     """
     print(f"\n{DIVIDER}")
-    print(termcolor.colored("❌ Model Error Detected", ERROR_COLOR, attrs=['bold']))
+    print(termcolor.colored("Model Error Detected", ERROR_COLOR, attrs=['bold']))
     print(f"{DIVIDER}\n")
     
     if error_type == "model_corrupted":
         print(termcolor.colored("One or more Ollama model files appear to be corrupted.", ERROR_COLOR))
         print()
-        print(termcolor.colored("📋 Troubleshooting Steps:", INFO_COLOR, attrs=['bold']))
+        print(termcolor.colored("Troubleshooting Steps:", INFO_COLOR, attrs=['bold']))
         
         print("1. First, try pulling the model again to repair it:")
         print(termcolor.colored(f"   ollama pull MODEL_NAME", CODE_COLOR))
@@ -74,13 +120,13 @@ def display_model_error(error_message, error_type):
         print("3. If problems persist, you may need to restart Ollama or check disk space")
         print()
         
-        print(termcolor.colored("ℹ️  Error details:", INFO_COLOR))
+        print(termcolor.colored("Error details:", INFO_COLOR))
         print(f"   {error_message}")
     
     elif error_type == "model_not_found":
         print(termcolor.colored("The requested model was not found in Ollama.", ERROR_COLOR))
         print()
-        print(termcolor.colored("📋 Available Commands:", INFO_COLOR, attrs=['bold']))
+        print(termcolor.colored("Available Commands:", INFO_COLOR, attrs=['bold']))
         
         print("• List available models:")
         print(termcolor.colored("   ollama list", CODE_COLOR))
@@ -90,13 +136,13 @@ def display_model_error(error_message, error_type):
         print(termcolor.colored("   ollama pull MODEL_NAME", CODE_COLOR))
         print()
         
-        print(termcolor.colored("ℹ️  Error details:", INFO_COLOR))
+        print(termcolor.colored("Error details:", INFO_COLOR))
         print(f"   {error_message}")
     
     elif error_type == "connection_error":
         print(termcolor.colored("Cannot connect to Ollama.", ERROR_COLOR))
         print()
-        print(termcolor.colored("📋 Troubleshooting:", INFO_COLOR, attrs=['bold']))
+        print(termcolor.colored("Troubleshooting:", INFO_COLOR, attrs=['bold']))
         
         print("1. Make sure Ollama is running:")
         print(termcolor.colored("   ollama serve", CODE_COLOR))
@@ -105,7 +151,7 @@ def display_model_error(error_message, error_type):
         print("2. Check the Ollama logs for errors")
         print()
         
-        print(termcolor.colored("ℹ️  Error details:", INFO_COLOR))
+        print(termcolor.colored("Error details:", INFO_COLOR))
         print(f"   {error_message}")
     
     else:
@@ -115,7 +161,7 @@ def display_model_error(error_message, error_type):
 
 def main():
     """Run the OllamaLink server."""
-    config = load_config()
+    config = load_config(Path("config.json"))
     
     parser = argparse.ArgumentParser(description="OllamaLink - Connect Cursor AI to Ollama models")
     
@@ -168,7 +214,7 @@ def main():
     print(termcolor.colored(f.renderText('OllamaLink'), HEADER_COLOR))
     print(termcolor.colored("Connect Cursor with Ollama models\n", SUBHEADER_COLOR))
     
-    print(termcolor.colored("⚙️  Configuration:", INFO_COLOR, attrs=['bold']))
+    print(termcolor.colored("Configuration:", INFO_COLOR, attrs=['bold']))
     print(f"• Ollama endpoint: {args.ollama}")
     print(f"• Server port: {args.port}")
     print(f"• Server host: {args.host}")
@@ -178,36 +224,58 @@ def main():
     print(f"• Max streaming tokens: {args.max_tokens}")
     print()
     
-    router = OllamaRouter(ollama_endpoint=args.ollama)
+    router = Router(ollama_endpoint=args.ollama)
     router.thinking_mode = args.thinking_mode
-    router.skip_integrity_check = args.skip_integrity
     
-    if hasattr(router, 'connection_error') and router.connection_error:
-        display_model_error(router.connection_error, "connection_error")
-        print(termcolor.colored("⚠️  OllamaLink will still start, but it won't be able to use models from Ollama", INFO_COLOR))
+    # Check Ollama client connection
+    if router.ollama_client and router.ollama_client.connection_error:
+        display_model_error(router.ollama_client.connection_error, "connection_error")
+        print(termcolor.colored("Warning: OllamaLink will still start, but it won't be able to use models from Ollama", INFO_COLOR))
         print(termcolor.colored("OllamaLink will use fallback settings until Ollama is available", INFO_COLOR))
-    elif hasattr(router, 'model_error') and router.model_error:
-        display_model_error(
-            router.model_error.get('message', 'Unknown model error'), 
-            router.model_error.get('type', 'unknown')
-        )
-        print(termcolor.colored("⚠️  OllamaLink will still start with available models", INFO_COLOR))
-    elif router.available_models:
-        print(termcolor.colored(f"✅ Found {len(router.available_models)} models:", SUCCESS_COLOR, attrs=['bold']))
-        for model in router.available_models:
-            print(f"• {model}")
+    elif router.ollama_client and router.ollama_client.available_models:
+        print(termcolor.colored(f"Success: Found {len(router.ollama_client.available_models)} Ollama models:", SUCCESS_COLOR, attrs=['bold']))
+        for model in router.ollama_client.available_models:
+            model_name = model.get('name', model.get('id', 'Unknown'))
+            print(f"• {model_name}")
         
-        print(termcolor.colored(f"\n🎯 Default model: {router.default_model}", SUCCESS_COLOR, attrs=['bold']))
+        default_model = router.ollama_mappings.get('default', 'llama3')
+        print(termcolor.colored(f"\nDefault Ollama model: {default_model}", SUCCESS_COLOR, attrs=['bold']))
     else:
-        print(termcolor.colored("❌ No Ollama models found. Is Ollama running?", ERROR_COLOR))
+        print(termcolor.colored("Error: No Ollama models found. Is Ollama running?", ERROR_COLOR))
         print(termcolor.colored("Please make sure Ollama is running with: ollama serve", INFO_COLOR))
     
+    # Show multi-provider information
     print()
-    print(termcolor.colored("🔄 Cursor will map standard model requests to:", INFO_COLOR, attrs=['bold']))
+    print(termcolor.colored("Provider Status:", INFO_COLOR, attrs=['bold']))
     
-    for api_model, local_model in router.model_mappings.items():
+    # Show Ollama status
+    if router.ollama_client:
+        if router.ollama_client.connection_error:
+            print("• Ollama: Disconnected")
+        else:
+            print(f"• Ollama: Connected ({len(router.ollama_client.available_models)} models)")
+    
+    # Show OpenRouter status
+    if router.openrouter_client:
+        print("• OpenRouter: Available")
+    else:
+        print("• OpenRouter: Disabled (configure in config.json)")
+    
+    # Show Llama.cpp status
+    if router.llamacpp_client:
+        print("• Llama.cpp: Available")
+    else:
+        print("• Llama.cpp: Disabled (configure in config.json)")
+    
+    print()
+    print(termcolor.colored("Model Mappings (Ollama):", INFO_COLOR, attrs=['bold']))
+    
+    for api_model, local_model in router.ollama_mappings.items():
         if api_model != "default":
-            resolved_model = router.get_model_name(api_model)
+            if router.ollama_client:
+                resolved_model = router.ollama_client.get_model_name(api_model, router.ollama_mappings)
+            else:
+                resolved_model = local_model
             print(f"• {api_model} → {resolved_model}")
     
     if args.max_tokens != config["ollama"].get("max_streaming_tokens", 32000):
@@ -215,47 +283,29 @@ def main():
         try:
             with open("config.json", "w") as f:
                 json.dump(config, f, indent=4)
-            print(termcolor.colored(f"ℹ️  Updated max_streaming_tokens in config.json to {args.max_tokens}", INFO_COLOR))
+            print(termcolor.colored(f"Info: Updated max_streaming_tokens in config.json to {args.max_tokens}", INFO_COLOR))
         except Exception as e:
-            print(termcolor.colored(f"⚠️  Could not update config.json: {str(e)}", ERROR_COLOR))
+            print(termcolor.colored(f"Warning: Could not update config.json: {str(e)}", ERROR_COLOR))
     
-    app = create_api(ollama_endpoint=args.ollama)
+    app = create_api()
     
+    # Determine host setting based on tunnel mode
     if args.tunnel:
-        async def run_with_tunnel():
-            config = uvicorn.Config(
-                app, 
-                host="0.0.0.0", 
-                port=args.port,
-                log_level="warning"
-            )
-            server = uvicorn.Server(config)
-            server_task = asyncio.create_task(server.serve())
-            
-            await asyncio.sleep(1)
-            
-            tunnel_url = await start_tunnel_cli(args.port)
-            
-            if tunnel_url:
-                cursor_url = f"{tunnel_url}/v1"
-                print(f"\n{DIVIDER}")
-                print(termcolor.colored(f"✅ OllamaLink server is running!", SUCCESS_COLOR, attrs=['bold']))
-                print(f"{DIVIDER}\n")
-                print(termcolor.colored("🔗 Use this URL in Cursor AI:", INFO_COLOR, attrs=['bold']))
-                print(termcolor.colored(f"{cursor_url}", CODE_COLOR, attrs=['bold']))
-                print()
-                print(termcolor.colored("📝 Instructions:", INFO_COLOR, attrs=['bold']))
-                print("1. In Cursor, go to settings > AI > Configure AI Provider")
-                print("2. Choose OpenAI Compatible and paste the URL above")
-                print("3. Chat with local Ollama models in Cursor!")
-                print()
-                print(termcolor.colored("Press CTRL+C to stop the server", INFO_COLOR))
-                print()
-                
-            await server_task
-                
-        asyncio.run(run_with_tunnel())
+        host = "127.0.0.1"
+        print(f"\n{DIVIDER}")
+        print(termcolor.colored(f"Starting OllamaLink server with tunnel support...", INFO_COLOR, attrs=['bold']))
+        print(f"{DIVIDER}\n")
+        
+        # Start tunnel in background thread after server starts
+        tunnel_thread = threading.Thread(
+            target=auto_start_tunnel, 
+            args=(args.port, host),
+            daemon=True
+        )
+        tunnel_thread.start()
+        
     else:
+        host = args.host
         if args.host == "0.0.0.0":
             host_display = "localhost"
         else:
@@ -264,16 +314,16 @@ def main():
         local_url = f"http://{host_display}:{args.port}/v1"
         
         print(f"\n{DIVIDER}")
-        print(termcolor.colored(f"✅ OllamaLink server is running!", SUCCESS_COLOR, attrs=['bold']))
+        print(termcolor.colored(f"Starting OllamaLink server in direct mode...", INFO_COLOR, attrs=['bold']))
         print(f"{DIVIDER}\n")
-        print(termcolor.colored("🔗 Use this URL in Cursor AI:", INFO_COLOR, attrs=['bold']))
+        print(termcolor.colored("Use this URL in Cursor AI:", INFO_COLOR, attrs=['bold']))
         print(termcolor.colored(f"{local_url}", CODE_COLOR, attrs=['bold']))
         print()
-        print(termcolor.colored("⚠️  Important:", ERROR_COLOR, attrs=['bold']))
+        print(termcolor.colored("Important:", ERROR_COLOR, attrs=['bold']))
         print("You're running in direct mode without a tunnel.")
         print("Cursor AI must be running on the same machine as OllamaLink.")
         print()
-        print(termcolor.colored("📝 Instructions:", INFO_COLOR, attrs=['bold']))
+        print(termcolor.colored("Instructions:", INFO_COLOR, attrs=['bold']))
         print("1. In Cursor, go to settings > AI > Configure AI Provider")
         print("2. Choose OpenAI Compatible and paste the URL above")
         print("3. Chat with local Ollama models in Cursor!")
@@ -281,7 +331,8 @@ def main():
         print(termcolor.colored("Press CTRL+C to stop the server", INFO_COLOR))
         print()
 
-        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # Start the API server (handles tunnels internally when requested)
+    uvicorn.run(app, host=host, port=args.port, log_level="warning")
 
 if __name__ == "__main__":
     main()
