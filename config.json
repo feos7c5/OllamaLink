@@ -3,7 +3,7 @@
         "api_key": "sk-cra"
     },
     "openrouter": {
-        "api_key": "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",
+        "api_key": "sk-or-v1-...",
         "endpoint": "https://openrouter.ai",
         "enabled": true,
         "model_mappings": {
